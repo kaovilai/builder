@@ -38,9 +38,22 @@ jobs:
           platforms: linux/amd64,linux/ppc64le,linux/arm64,linux/s390x
           push: true
           tags: quay.io/konveyor/builder:latest
-      - name: push tagged version
-        run: |
-          docker tag quay.io/konveyor/builder:latest quay.io/konveyor/builder:v$(docker run --rm quay.io/konveyor/builder:latest go version | cut -c 14-19)
-          docker tag quay.io/konveyor/builder:latest quay.io/konveyor/builder:v$(docker run --rm quay.io/konveyor/builder:latest go version | cut -c 14-17)
-          docker push quay.io/konveyor/builder:v$(docker run --rm quay.io/konveyor/builder:latest go version | cut -c 14-19)
-          docker push quay.io/konveyor/builder:v$(docker run --rm quay.io/konveyor/builder:latest go version | cut -c 14-17)
+          cache-to: type=local,dest=/tmp/.buildx-cache
+      - name: get go version
+        id: go_version_patch
+        run: | 
+          echo "patch_version=$(docker run --rm quay.io/konveyor/builder:latest go version | cut -c 14-19)" >> $GITHUB_ENV
+      - name: get go version
+        id: go_version_minor
+        run: | 
+          echo "minor_version=$(docker run --rm quay.io/konveyor/builder:latest go version | cut -c 14-17)" >> $GITHUB_ENV
+      - name: reuse cache to push tagged Multi-arch images...
+        uses: docker/build-push-action@v2
+        with:
+          builder: ${{ steps.docker_buildx.outputs.name }}
+          context: .
+          file: ./Dockerfile.ubi8
+          platforms: linux/amd64,linux/ppc64le,linux/arm64,linux/s390x
+          push: true
+          tags: quay.io/konveyor/builder:v${{ env.minor_version }},quay.io/konveyor/builder:v${{ env.patch_version }}
+          cache-from: type=local,src=/tmp/.buildx-cache
