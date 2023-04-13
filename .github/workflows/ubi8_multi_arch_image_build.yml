@@ -3,8 +3,15 @@ name: 'UBI 8 multi-arch image build'
 on:
   workflow_dispatch:
   push:
+    paths:
+      - 'Dockerfile.ubi8'
+      - '.github/workflows/ubi8_multi_arch_image_build.yml'
   schedule:
     - cron: '0 0 * * 6'
+  pull_request:
+    paths:
+      - 'Dockerfile.ubi8'
+      - '.github/workflows/ubi8_multi_arch_image_build.yml'
 jobs:
   multiarch-build:
     runs-on: ubuntu-latest

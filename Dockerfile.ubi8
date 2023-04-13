@@ -16,7 +16,7 @@ FROM registry.access.redhat.com/ubi8:latest
 COPY --from=builder /root/rpmbuild/RPMS/*/golang-1* ./
 COPY --from=builder /root/rpmbuild/RPMS/*/golang-bin-1* ./
 COPY --from=builder /root/rpmbuild/RPMS/*/golang-src-1* ./
-RUN dnf -y install ./golang* git
+RUN dnf -y install ./golang* git make
 
 #This just makes it easier to switch to/from go-toolset.
 ENV APP_ROOT /opt/app-root
