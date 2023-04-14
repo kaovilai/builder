@@ -56,21 +56,24 @@ jobs:
           context: .
           file: ./go.dev.Dockerfile.ubi9
           platforms: linux/amd64,linux/ppc64le,linux/arm64,linux/s390x
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ghcr.io/${{ github.repository_owner }}/builder:ubi9-godev-latest
           cache-to: type=local,dest=/tmp/.buildx-cache
           provenance: false
           build-args: |
             GO_VERSION=${{ env.GO_VERSION }}
       - name: get go version
+        if: github.event_name != 'pull_request'
         id: go_version_patch
         run: | 
           echo "patch_version=$(docker run --rm ghcr.io/${{ github.repository_owner }}/builder:ubi9-godev-latest go version | cut -c 14-19)" >> $GITHUB_ENV
       - name: get go version
+        if: github.event_name != 'pull_request'
         id: go_version_minor
         run: | 
           echo "minor_version=$(docker run --rm ghcr.io/${{ github.repository_owner }}/builder:ubi9-godev-latest go version | cut -c 14-17)" >> $GITHUB_ENV
       - name: reuse cache to push tagged Multi-arch images...
+        if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v3.3.0
         with:
           builder: ${{ steps.docker_buildx.outputs.name }}
