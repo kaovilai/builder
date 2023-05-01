@@ -10,12 +10,17 @@ RUN if [ -z "$GO_VERSION" ] || [ "$GO_VERSION" = "go" ]; then \
     export GO_VERSION=$(curl -q https://go.dev/dl/?mode=json | jq .[0].version | sed 's/\"//g'); \
     fi && \
     echo "GO_VERSION is set to $GO_VERSION" && \
+    export GOOS=$(go env GOOS) && \
+    export GOARCH=$(go env GOARCH) && \
     export GOPATH=$(go env GOPATH) && \
-    go install golang.org/dl/$GO_VERSION@latest && \
-    $GOPATH/bin/$GO_VERSION download && \
-    mv $GOPATH/bin/$GO_VERSION /usr/bin/go && \
+    rm -rf $GOPATH && \
+    rm -f /usr/bin/go && \
+    mkdir -p /go && \
+    curl -L https://go.dev/dl/$GO_VERSION.$GOOS-$GOARCH.tar.gz -o $GO_VERSION.$GOOS-$GOARCH.tar.gz && \
+    tar -C / -xzf $GO_VERSION.$GOOS-$GOARCH.tar.gz && \
+    rm -f $GO_VERSION.$GOOS-$GOARCH.tar.gz && \
+    export PATH=$PATH:/go/bin && \
+    go env && \
     go version
 
-#This just makes it easier to switch to/from go-toolset.
-ENV APP_ROOT /opt/app-root
-ENV GOPATH /opt/app-root/src/go
+ENV PATH=$PATH:/go/bin
