@@ -53,6 +53,10 @@ jobs:
       - name: Check version availability and dispatch builds
         run: |
           set -euo pipefail
+          # Bash clears errexit inside command substitutions unless this is set;
+          # without it a failed curl/jq in published_tags would yield a partial
+          # tag list and the dispatcher would act on incomplete data.
+          shopt -s inherit_errexit
 
           # --- Standard (non-FIPS) image variants ---------------------------------
           # Maps a UBI variant to its published quay tag prefix and its build workflow.
@@ -136,7 +140,9 @@ jobs:
           # "build latest".
           # ------------------------------------------------------------------------
           echo "Checking OpenSSL FIPS image versions ..."
-          fips_releases=$(gh api repos/golang-fips/go/releases --paginate)
+          # jq -s 'add' flattens the paginated response into one array regardless
+          # of how gh emits pages, so the selection below always sees all releases.
+          fips_releases=$(gh api repos/golang-fips/go/releases --paginate | jq -s 'add')
           mapfile -t FIPS_ENTRIES < <(echo "$fips_releases" | jq -r '
             def cands: [ .[] | select(.draft == false)
               | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
@@ -165,9 +171,14 @@ jobs:
             done
           done
 
-          # Refresh the generated README version badges so they converge weekly even
-          # if a build-time trigger was missed. readme-badges.yml only makes sense
-          # from default-branch runs, so gate it the same way as dispatching.
+      - name: Refresh README version badges
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          # The badge refresh does not depend on the version check above, so run
+          # it even when that step failed — badges still converge weekly.
+          # readme-badges.yml only makes sense from default-branch runs, so gate
+          # it the same way as dispatching.
           if [ "$GITHUB_REF" = "refs/heads/${DEFAULT_BRANCH}" ] && [ "${DRY_RUN}" != "true" ]; then
             echo "Refreshing README version badges ..."
             gh workflow run readme-badges.yml

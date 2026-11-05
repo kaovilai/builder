@@ -34,6 +34,10 @@ jobs:
       - name: regenerate version badges...
         run: |
           set -euo pipefail
+          # Bash clears errexit inside command substitutions unless this is set;
+          # without it a failed curl/jq in published_tags would yield a partial
+          # tag list instead of failing the run.
+          shopt -s inherit_errexit
 
           # Collect all active tags published to quay.io/konveyor/builder.
           published_tags() {
@@ -89,7 +93,8 @@ jobs:
             git add README.md
             git commit -s -m "Update README version badges (generated)"
             # Pick up anything that landed between checkout and this push, so
-            # back-to-back refreshes never race into a non-fast-forward reject.
+            # back-to-back refreshes never race into a non-fast-forward reject;
+            # retry once if something still lands inside the pull-to-push window.
             git pull --rebase
-            git push
+            git push || { git pull --rebase && git push; }
           fi

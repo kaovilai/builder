@@ -29,7 +29,7 @@ jobs:
         run: |
           # Fetch golang-fips/go releases (newest first from GitHub API)
           # Uses gh api for authenticated requests (higher rate limit)
-          fips_releases=$(gh api repos/golang-fips/go/releases --paginate)
+          fips_releases=$(gh api repos/golang-fips/go/releases --paginate | jq -s 'add')
 
           # FIPS tag selection (same rules as scheduled_dispatch.yml):
           # - candidates: non-draft releases tagged go<version>-<build>-(openssl-fips|hostfips-release);
