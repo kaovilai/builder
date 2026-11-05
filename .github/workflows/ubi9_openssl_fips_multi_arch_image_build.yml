@@ -31,24 +31,36 @@ jobs:
           # Uses gh api for authenticated requests (higher rate limit)
           fips_releases=$(gh api repos/golang-fips/go/releases --paginate)
 
+          # FIPS tag selection (same rules as scheduled_dispatch.yml):
+          # - candidates: non-draft releases tagged go<version>-<build>-(openssl-fips|hostfips-release);
+          #   the pure-digit build segment excludes rc tags (e.g. go1.18.3-0.rc1-openssl-fips)
+          # - golang-fips ships Go 1.27+ FIPS via the native crypto/fips140 module
+          #   ("hostfips-release" tags); older minors keep "openssl-fips" tags
+          # - per minor: prefer the newest stable release, falling back to the newest
+          #   prerelease when that minor has no stable release yet
+          # - top 2 minor versions, matching Go's two-release support policy
+          JQ_FIPS='
+            def cands: [ .[] | select(.draft == false)
+              | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
+              | {tag: .tag_name, pre: .prerelease} ];
+            def vkey: (.tag | split("-")[0] | ltrimstr("go") | split(".") | map(tonumber));
+            def bkey: (.tag | split("-")[1] | tonumber);
+            def ossl: (if .tag | endswith("openssl-fips") then 1 else 0 end);
+            def best: max_by([ (if .pre then 0 else 1 end), vkey, bkey, ossl ]);
+          '
+          top2() {
+            echo "$fips_releases" | jq -c "${JQ_FIPS}"'
+              cands | group_by(vkey | .[0:2]) | sort_by(.[0] | vkey | .[0:2]) | reverse
+              | .[0:2] | map(best)
+            '
+          }
+
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            # Get latest release per minor version, take top 2 minor versions
-            # (matching Go's two-release support policy)
-            matrix=$(echo "$fips_releases" | jq -c '
-              [.[] | select(.prerelease == false and .draft == false and (.tag_name | endswith("-openssl-fips"))) | .tag_name] |
-              sort_by(split("-")[0] | ltrimstr("go") | split(".") | map(tonumber)) | reverse |
-              reduce .[] as $tag (
-                {seen: {}, result: []};
-                ($tag | split("-")[0] | ltrimstr("go") | split(".") | .[0:2] | join(".")) as $minor |
-                if (.seen[$minor] | not) and (.result | length) < 2
-                then .seen[$minor] = true | .result += [$tag]
-                else .
-                end
-              ) | .result |
+            matrix=$(top2 | jq -c '
               to_entries |
               map(
-                if .key == 0 then {fips_tag: .value, tag_suffix: ""}
-                else {fips_tag: .value, tag_suffix: (.value | split("-")[0] | ltrimstr("go"))}
+                if .key == 0 then {fips_tag: .value.tag, tag_suffix: ""}
+                else {fips_tag: .value.tag, tag_suffix: (.value.tag | split("-")[0] | ltrimstr("go"))}
                 end
               ) |
               {include: .}
@@ -57,17 +69,17 @@ jobs:
             input_version="${{ github.event.inputs.go_version }}"
             if [ -n "$input_version" ]; then
               # Find matching FIPS tag for provided Go version
-              fips_tag=$(echo "$fips_releases" | jq -r --arg v "go${input_version}" \
-                '[.[] | select(.prerelease == false and .draft == false) | .tag_name | select(startswith($v + "-") and endswith("-openssl-fips"))] | sort | last // empty')
+              fips_tag=$(echo "$fips_releases" | jq -r --arg v "go${input_version}" "${JQ_FIPS}"'
+                cands | map(select(.tag | startswith($v + "-"))) | best | .tag // empty
+              ')
               if [ -z "$fips_tag" ] || [ "$fips_tag" = "null" ]; then
                 echo "ERROR: No golang-fips release found for go${input_version}"
                 exit 1
               fi
               matrix=$(jq -nc --arg t "$fips_tag" --arg s "$input_version" '{include: [{fips_tag: $t, tag_suffix: $s}]}')
             else
-              # Empty input = latest
-              fips_tag=$(echo "$fips_releases" | jq -r \
-                '[.[] | select(.prerelease == false and .draft == false and (.tag_name | endswith("-openssl-fips"))) | .tag_name] | sort_by(split("-")[0] | ltrimstr("go") | split(".") | map(tonumber)) | reverse | first')
+              # Empty input = latest (best release of the newest minor)
+              fips_tag=$(top2 | jq -r '.[0].tag')
               matrix=$(jq -nc --arg t "$fips_tag" '{include: [{fips_tag: $t, tag_suffix: ""}]}')
             fi
           fi
@@ -160,7 +172,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [determine-versions, build]
     permissions:
-      actions: read
+      actions: write
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.determine-versions.outputs.matrix) }}
@@ -237,3 +249,10 @@ jobs:
             -t quay.io/konveyor/builder:ubi9-openssl-fips-v${{ env.minor_version }} \
             -t quay.io/konveyor/builder:ubi9-openssl-fips-v${{ env.patch_version }} \
             $(printf 'quay.io/konveyor/builder@sha256:%s ' $(ls /tmp/digests))
+
+      - name: refresh README version badges...
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run readme-badges.yml

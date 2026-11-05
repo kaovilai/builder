@@ -1,0 +1,83 @@
+name: 'Update README version badges'
+
+# Regenerates the README region between the readme-badges markers from the
+# tags currently published on quay.io/konveyor/builder and commits any change
+# as github-actions[bot]. Triggered by the image build workflows after they
+# publish new tags, and by scheduled_dispatch.yml for weekly convergence.
+# Uses the builtin GITHUB_TOKEN (workflow_dispatch is an explicit exception
+# to the GITHUB_TOKEN recursion guard), so no additional secret is required.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: readme-badges
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: add checkout action...
+        uses: actions/checkout@v6
+
+      - name: regenerate version badges...
+        run: |
+          set -euo pipefail
+
+          # Collect all active tags published to quay.io/konveyor/builder.
+          published_tags() {
+            local page=1 resp
+            while :; do
+              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
+                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
+              echo "$resp" | jq -r '.tags[].name'
+              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
+              page=$((page + 1))
+            done
+          }
+          PUBLISHED_TAGS="$(published_tags)"
+
+          # Latest published Go version per image variant.
+          latest_for() {
+            grep -E "$1" <<< "$PUBLISHED_TAGS" \
+              | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+)$/\1/' | sort -V | tail -1
+          }
+
+          badge() {
+            # $1 = label, $2 = published-tag regex, $3 = color
+            local ver
+            ver="$(latest_for "$2")"
+            if [ -n "$ver" ]; then
+              echo "[![${1}](https://img.shields.io/badge/${1// /_}-Go_${ver}-${3})](https://quay.io/repository/konveyor/builder?tab=tags)"
+            fi
+          }
+
+          {
+            badge "UBI 8"       '^v[0-9]+\.[0-9]+\.[0-9]+$' blue
+            badge "UBI 9"       '^ubi9-v[0-9]+\.[0-9]+\.[0-9]+$' blue
+            badge "UBI 10"      '^ubi10-v[0-9]+\.[0-9]+\.[0-9]+$' blue
+            badge "UBI 8 FIPS"  '^openssl-fips-v[0-9]+\.[0-9]+\.[0-9]+$' blueviolet
+            badge "UBI 9 FIPS"  '^ubi9-openssl-fips-v[0-9]+\.[0-9]+\.[0-9]+$' blueviolet
+            badge "UBI 10 FIPS" '^ubi10-openssl-fips-v[0-9]+\.[0-9]+\.[0-9]+$' blueviolet
+          } > /tmp/badges.md
+
+          # Replace the generated region between the markers.
+          awk -v block="$(cat /tmp/badges.md)" '
+            /<!-- readme-badges:start/ {print; print block; skip=1; next}
+            /<!-- readme-badges:end/   {skip=0; print; next}
+            !skip {print}
+          ' README.md > README.md.new && mv README.md.new README.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet README.md; then
+            echo "README version badges already up to date."
+          else
+            git add README.md
+            git commit -s -m "Update README version badges (generated)"
+            git push
+          fi

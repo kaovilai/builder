@@ -125,25 +125,29 @@ jobs:
           done
 
           # ------------------------------------------------------------------------
-          # FIPS images: supported versions come from golang-fips/go releases. Keep
-          # the latest release for each of the two newest minor versions (matching
-          # Go's two-release support policy). Index 0 is the latest; the build
-          # workflow treats an empty go_version as "build latest".
+          # FIPS images: supported versions come from golang-fips/go releases.
+          # Candidates are non-draft releases tagged go<version>-<build>-(openssl-fips|hostfips-release)
+          # (the pure-digit build segment excludes rc tags); golang-fips ships Go 1.27+
+          # FIPS via the native crypto/fips140 module ("hostfips-release" tags) while
+          # older minors keep "openssl-fips" tags. Per minor, prefer the newest stable
+          # release, falling back to the newest prerelease when that minor has no
+          # stable release yet. Top 2 minors, matching Go's two-release support policy.
+          # Index 0 is the latest; the build workflow treats an empty go_version as
+          # "build latest".
           # ------------------------------------------------------------------------
           echo "Checking OpenSSL FIPS image versions ..."
           fips_releases=$(gh api repos/golang-fips/go/releases --paginate)
           mapfile -t FIPS_ENTRIES < <(echo "$fips_releases" | jq -r '
-            [.[] | select(.prerelease == false and .draft == false and (.tag_name | endswith("-openssl-fips"))) | .tag_name] |
-            sort_by(split("-")[0] | ltrimstr("go") | split(".") | map(tonumber)) | reverse |
-            reduce .[] as $tag (
-              {seen: {}, result: []};
-              ($tag | split("-")[0] | ltrimstr("go") | split(".") | .[0:2] | join(".")) as $minor |
-              if (.seen[$minor] | not) and (.result | length) < 2
-              then .seen[$minor] = true | .result += [$tag]
-              else .
-              end
-            ) | .result |
-            to_entries[] | "\(.key) \((.value | split("-")[0] | ltrimstr("go")))"
+            def cands: [ .[] | select(.draft == false)
+              | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
+              | {tag: .tag_name, pre: .prerelease} ];
+            def vkey: (.tag | split("-")[0] | ltrimstr("go") | split(".") | map(tonumber));
+            def bkey: (.tag | split("-")[1] | tonumber);
+            def ossl: (if .tag | endswith("openssl-fips") then 1 else 0 end);
+            def best: max_by([ (if .pre then 0 else 1 end), vkey, bkey, ossl ]);
+            cands | group_by(vkey | .[0:2]) | sort_by(.[0] | vkey | .[0:2]) | reverse
+            | .[0:2] | map(best)
+            | to_entries[] | "\(.key) \(.value.tag | split("-")[0] | ltrimstr("go"))"
           ')
 
           for entry in "${FIPS_ENTRIES[@]}"; do
@@ -160,3 +164,13 @@ jobs:
               fi
             done
           done
+
+          # Refresh the generated README version badges so they converge weekly even
+          # if a build-time trigger was missed. readme-badges.yml only makes sense
+          # from default-branch runs, so gate it the same way as dispatching.
+          if [ "$GITHUB_REF" = "refs/heads/${DEFAULT_BRANCH}" ] && [ "${DRY_RUN}" != "true" ]; then
+            echo "Refreshing README version badges ..."
+            gh workflow run readme-badges.yml
+          else
+            echo "[skip: not on ${DEFAULT_BRANCH} or dry-run] would refresh README version badges"
+          fi

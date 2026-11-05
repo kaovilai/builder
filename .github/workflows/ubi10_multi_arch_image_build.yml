@@ -110,7 +110,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [determine-versions, build]
     permissions:
-      actions: read
+      actions: write
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.determine-versions.outputs.matrix) }}
@@ -187,3 +187,10 @@ jobs:
             -t quay.io/konveyor/builder:ubi10-v${{ env.minor_version }} \
             -t quay.io/konveyor/builder:ubi10-v${{ env.patch_version }} \
             $(printf 'quay.io/konveyor/builder@sha256:%s ' $(ls /tmp/digests))
+
+      - name: refresh README version badges...
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run readme-badges.yml
