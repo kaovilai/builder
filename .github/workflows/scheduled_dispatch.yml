@@ -1,0 +1,162 @@
+name: 'Scheduled version check and dispatch'
+
+# Single scheduled entry point for all image builds.
+#
+# Instead of every build workflow running on its own weekly `schedule`, this
+# workflow runs once on a schedule, determines the Go versions that upstream
+# currently supports (go.dev for the standard images, golang-fips/go for the
+# OpenSSL FIPS images) and compares them against the versions already published
+# to quay.io/konveyor/builder. It only dispatches a build workflow when a newer
+# (differing) version is available than the one currently published.
+#
+# workflow_dispatch events are an explicit exception to the rule that
+# GITHUB_TOKEN cannot trigger new workflow runs, so no additional token is
+# required (see https://docs.github.com/en/actions/concepts/security/github_token).
+#
+# The dispatch job sets GH_REPO because it never checks out the repository:
+# without it, `gh workflow run` cannot resolve the repository and fails with
+# "failed to run git: fatal: not a git repository". Only runs on the default
+# branch dispatch builds; pushes to other branches (and manual dispatches from
+# other refs) validate the version check without dispatching.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Log the workflows that would be dispatched without dispatching them'
+        required: false
+        type: boolean
+        default: false
+  push:
+    paths:
+      - '.github/workflows/scheduled_dispatch.yml'
+  schedule:
+    - cron: '0 0 * * 6'
+
+concurrency:
+  group: scheduled-dispatch
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+    steps:
+      - name: Check version availability and dispatch builds
+        run: |
+          set -euo pipefail
+
+          # --- Standard (non-FIPS) image variants ---------------------------------
+          # Maps a UBI variant to its published quay tag prefix and its build workflow.
+          declare -A NONFIPS_PREFIX=( [ubi8]="" [ubi9]="ubi9-" [ubi10]="ubi10-" )
+          declare -A NONFIPS_WF=(
+            [ubi8]="ubi8_multi_arch_image_build.yml"
+            [ubi9]="ubi9_multi_arch_image_build.yml"
+            [ubi10]="ubi10_multi_arch_image_build.yml"
+          )
+
+          # --- OpenSSL FIPS image variants ----------------------------------------
+          declare -A FIPS_PREFIX=( [ubi8]="openssl-fips-" [ubi9]="ubi9-openssl-fips-" [ubi10]="ubi10-openssl-fips-" )
+          declare -A FIPS_WF=(
+            [ubi8]="ubi8_openssl_fips_multi_arch_image_build.yml"
+            [ubi9]="ubi9_openssl_fips_multi_arch_image_build.yml"
+            [ubi10]="ubi10_openssl_fips_multi_arch_image_build.yml"
+          )
+
+          # Collect all active tags published to quay.io/konveyor/builder.
+          published_tags() {
+            local page=1 resp
+            while :; do
+              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
+                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
+              echo "$resp" | jq -r '.tags[].name'
+              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
+              page=$((page + 1))
+            done
+          }
+
+          echo "Fetching published tags from quay.io/konveyor/builder ..."
+          PUBLISHED_TAGS="$(published_tags)"
+
+          tag_published() { grep -qxF "$1" <<< "$PUBLISHED_TAGS"; }
+
+          dispatch() {
+            # $1 = workflow file, $2 = go_version input
+            local wf="$1" input="$2"
+            if [ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+              echo "  [skip: not on ${DEFAULT_BRANCH}] would dispatch ${wf} (go_version='${input}')"
+            elif [ "${DRY_RUN}" = "true" ]; then
+              echo "  [dry-run] would dispatch ${wf} (go_version='${input}')"
+            else
+              echo "  dispatching ${wf} (go_version='${input}')"
+              gh workflow run "${wf}" -f go_version="${input}"
+            fi
+          }
+
+          # ------------------------------------------------------------------------
+          # Standard images: supported Go versions come from go.dev (newest first,
+          # one entry per supported minor release). Index 0 is the latest release;
+          # the build workflow treats an empty go_version as "build latest".
+          # ------------------------------------------------------------------------
+          echo "Checking standard (non-FIPS) image versions ..."
+          go_json=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 'https://go.dev/dl/?mode=json')
+          mapfile -t GO_VERSIONS < <(echo "$go_json" | jq -r '[.[] | select(.stable == true) | .version | ltrimstr("go")] | .[0:2] | .[]')
+
+          for idx in "${!GO_VERSIONS[@]}"; do
+            ver="${GO_VERSIONS[$idx]}"
+            if [ "$idx" -eq 0 ]; then input=""; else input="$ver"; fi
+            for ubi in ubi8 ubi9 ubi10; do
+              expected="${NONFIPS_PREFIX[$ubi]}v${ver}"
+              if tag_published "$expected"; then
+                echo "[$ubi] $expected already published, skipping"
+              else
+                echo "[$ubi] $expected not published, newer version available"
+                dispatch "${NONFIPS_WF[$ubi]}" "$input"
+              fi
+            done
+          done
+
+          # ------------------------------------------------------------------------
+          # FIPS images: supported versions come from golang-fips/go releases. Keep
+          # the latest release for each of the two newest minor versions (matching
+          # Go's two-release support policy). Index 0 is the latest; the build
+          # workflow treats an empty go_version as "build latest".
+          # ------------------------------------------------------------------------
+          echo "Checking OpenSSL FIPS image versions ..."
+          fips_releases=$(gh api repos/golang-fips/go/releases --paginate)
+          mapfile -t FIPS_ENTRIES < <(echo "$fips_releases" | jq -r '
+            [.[] | select(.prerelease == false and .draft == false and (.tag_name | endswith("-openssl-fips"))) | .tag_name] |
+            sort_by(split("-")[0] | ltrimstr("go") | split(".") | map(tonumber)) | reverse |
+            reduce .[] as $tag (
+              {seen: {}, result: []};
+              ($tag | split("-")[0] | ltrimstr("go") | split(".") | .[0:2] | join(".")) as $minor |
+              if (.seen[$minor] | not) and (.result | length) < 2
+              then .seen[$minor] = true | .result += [$tag]
+              else .
+              end
+            ) | .result |
+            to_entries[] | "\(.key) \((.value | split("-")[0] | ltrimstr("go")))"
+          ')
+
+          for entry in "${FIPS_ENTRIES[@]}"; do
+            idx="${entry%% *}"
+            ver="${entry#* }"
+            if [ "$idx" -eq 0 ]; then input=""; else input="$ver"; fi
+            for ubi in ubi8 ubi9 ubi10; do
+              expected="${FIPS_PREFIX[$ubi]}v${ver}"
+              if tag_published "$expected"; then
+                echo "[$ubi-fips] $expected already published, skipping"
+              else
+                echo "[$ubi-fips] $expected not published, newer version available"
+                dispatch "${FIPS_WF[$ubi]}" "$input"
+              fi
+            done
+          done

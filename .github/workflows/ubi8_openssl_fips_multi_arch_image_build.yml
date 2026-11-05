@@ -11,8 +11,6 @@ on:
     paths:
       - 'Dockerfile.ubi8-openssl-fips'
       - '.github/workflows/ubi8_openssl_fips_multi_arch_image_build.yml'
-  schedule:
-    - cron: '0 2 * * 6'
   pull_request:
     paths:
       - 'Dockerfile.ubi8-openssl-fips'
@@ -33,7 +31,7 @@ jobs:
           # Uses gh api for authenticated requests (higher rate limit)
           fips_releases=$(gh api repos/golang-fips/go/releases --paginate)
 
-          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
             # Get latest release per minor version, take top 2 minor versions
             # (matching Go's two-release support policy)
             matrix=$(echo "$fips_releases" | jq -c '
@@ -178,6 +176,29 @@ jobs:
           path: /tmp/digests
           pattern: digests-*-${{ env.FIPS_TAG_SAFE }}
           merge-multiple: true
+
+      - name: wait for image digests...
+        run: |
+          set -euo pipefail
+
+          for digest in /tmp/digests/*; do
+            digest="sha256:$(basename "$digest")"
+
+            for attempt in {1..6}; do
+              if docker buildx imagetools inspect \
+                "quay.io/konveyor/builder@${digest}" >/dev/null 2>&1; then
+                break
+              fi
+
+              if [ "$attempt" -eq 6 ]; then
+                echo "Digest unavailable after retries: ${digest}"
+                exit 1
+              fi
+
+              echo "Waiting for Quay to expose ${digest} (attempt ${attempt}/6)"
+              sleep 10
+            done
+          done
 
       - name: login to Quay.io...
         if: github.event_name != 'pull_request'
