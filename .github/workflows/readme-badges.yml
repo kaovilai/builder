@@ -23,6 +23,13 @@ jobs:
     steps:
       - name: add checkout action...
         uses: actions/checkout@v6
+        with:
+          # Always the default-branch tip at run start: queued workflow_dispatch
+          # runs otherwise check out the commit snapshotted at dispatch time, and
+          # pushing on top of it is rejected as non-fast-forward once another
+          # refresh has landed. Full history so the pre-push rebase works.
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
 
       - name: regenerate version badges...
         run: |
@@ -41,10 +48,12 @@ jobs:
           }
           PUBLISHED_TAGS="$(published_tags)"
 
-          # Latest published Go version per image variant.
+          # Latest published Go version per image variant. Empty when the variant
+          # has no matching tag yet — grep exits 1 on no match, so the pipeline
+          # needs `|| true` to keep set -e/pipefail from aborting the run.
           latest_for() {
             grep -E "$1" <<< "$PUBLISHED_TAGS" \
-              | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+)$/\1/' | sort -V | tail -1
+              | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+)$/\1/' | sort -V | tail -1 || true
           }
 
           badge() {
@@ -79,5 +88,8 @@ jobs:
           else
             git add README.md
             git commit -s -m "Update README version badges (generated)"
+            # Pick up anything that landed between checkout and this push, so
+            # back-to-back refreshes never race into a non-fast-forward reject.
+            git pull --rebase
             git push
           fi
