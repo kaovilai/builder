@@ -105,16 +105,26 @@ jobs:
 
           # SBOMs are generated per platform (mirrors the build matrix in
           # image-build.yml): a manifest-list scan only covers the runner's
-          # architecture otherwise. Scans skipped for assets already on the
-          # release, so weekly reconciliation only pays for what's new.
+          # architecture otherwise. Asset names carry the image digest — a
+          # rebuild republishing the same version with a new digest produces
+          # new asset names, so reconciliation rescans them instead of
+          # skipping on the unchanged name. Scans are skipped only for
+          # assets already on the release.
           PLATFORMS="linux/amd64 linux/arm64 linux/ppc64le linux/s390x"
+          expected_assets() { # $1=entries — must match make_sboms' naming
+            while IFS=$'\t' read -r _ f d t; do
+              for platform in $PLATFORMS; do
+                echo "${f}-${platform//\//-}-${d#sha256:}.spdx.json"
+              done
+            done <<< "$1"
+          }
           make_sboms() { # $1=entries $2=sbom_dir $3=file listing existing asset names
             while IFS=$'\t' read -r _ f d t; do
               # scan by digest: the tag is mutable and could be re-published
               # between selection and scan, making SBOM and notes disagree
               image="quay.io/konveyor/builder@${d}"
               for platform in $PLATFORMS; do
-                out="${f}-${platform//\//-}.spdx.json"
+                out="${f}-${platform//\//-}-${d#sha256:}.spdx.json"
                 [ -n "$3" ] && grep -qx "$out" "$3" && continue
                 docker run --rm -v "${2}:/out" docker.io/anchore/syft:1.33.0 \
                   scan "$image" --platform "$platform" -o spdx-json --file "/out/${out}" >/dev/null
@@ -148,15 +158,31 @@ jobs:
             elif gh release view "$release_tag" >/dev/null 2>&1; then
               # Reconcile: a variant published after this release was created
               # must still land in its notes and SBOMs. Notes are regenerated
-              # (idempotent) and only missing SBOM assets are scanned+uploaded.
-              gh release view "$release_tag" --json assets -q '.assets[].name' > "${sbom_dir}/existing" || : > "${sbom_dir}/existing"
-              make_sboms "$entries" "$sbom_dir" "${sbom_dir}/existing"
+              # (idempotent), only missing SBOM assets are scanned+uploaded
+              # (digest-named, so a rebuilt image rescans), and SBOM assets
+              # that no longer match the shipped set are pruned.
+              expected=$(mktemp /tmp/expected.XXXXXX)
+              expected_assets "$entries" > "$expected"
+              existing="${sbom_dir}/existing"
+              gh release view "$release_tag" --json assets -q '.assets[].name' > "$existing" || : > "$existing"
+              make_sboms "$entries" "$sbom_dir" "$existing"
               gh release edit "$release_tag" --notes-file "$notes" >/dev/null
               shopt -s nullglob
               new_assets=("${sbom_dir}"/*.spdx.json)
               if [ "${#new_assets[@]}" -gt 0 ]; then
                 gh release upload "$release_tag" "${new_assets[@]}"
               fi
+              while read -r asset; do
+                case "$asset" in
+                  *.spdx.json)
+                    if ! grep -qx "$asset" "$expected"; then
+                      gh release delete-asset "$release_tag" "$asset" --yes
+                      echo "pruned stale SBOM asset ${asset}"
+                    fi
+                    ;;
+                esac
+              done < "$existing"
+              rm -f "$expected"
               echo "Reconciled release ${release_tag}"
             else
               make_sboms "$entries" "$sbom_dir" ""

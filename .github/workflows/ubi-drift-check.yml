@@ -141,9 +141,18 @@ jobs:
                 # major pending and retried next week.
                 while read -r alias was of; do
                   [ -n "$alias" ] || continue
-                  lat_now=$(awk -v t="$alias" '$1 == t {print $2; exit}' /tmp/tags.txt)
+                  # live registry value, not the /tmp/tags.txt snapshot: a
+                  # build promoting latest between the snapshot and this
+                  # re-point must not be demoted. (The window between this
+                  # inspect and the create below is seconds; the registry
+                  # offers no compare-and-swap to close it entirely.)
+                  lat_now=$(docker buildx imagetools inspect \
+                    "quay.io/konveyor/builder:${alias}" \
+                    --format '{{.Manifest.Digest}}' 2>/dev/null || true)
                   new_d=$(awk -v t="$of" '$1 == t {print $2; exit}' /tmp/tags.txt)
-                  if [ -z "$lat_now" ] || [ "$lat_now" != "$was" ]; then
+                  if [ -z "$lat_now" ]; then
+                    echo "[ubi${major}] ${alias}: could not inspect current digest; leaving it"
+                  elif [ "$lat_now" != "$was" ]; then
                     echo "[ubi${major}] ${alias} moved since dispatch; leaving it"
                   elif [ -z "$new_d" ] || [ "$new_d" = "$was" ]; then
                     echo "[ubi${major}] ${alias}: ${of} not republished with a new digest; leaving it"
@@ -300,7 +309,14 @@ jobs:
                 done < <(awk -v m="$major" -v f="$flavor" '$1 == m && $2 == f {print $3}' /tmp/dispatched.txt)
               done < <(awk -v m="$major" '$1 == m {print $2}' /tmp/dispatched.txt | sort -u)
               now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
-              state=$(jq -c --arg m "$major" --arg d "$now" --arg t "$dispatched_at" --argjson tg "$targets_json" --argjson lt "$latest_json" \
+              # union with the existing pending.latest by alias (new wins):
+              # a partial retry dispatches only the unpublished tags, and
+              # its fresh mappings can't cover an alias backed by an
+              # already-published target — dropping that mapping would
+              # strand the alias on the stale base forever
+              merged_latest=$(jq -c --arg m "$major" --argjson lt "$latest_json" \
+                '($lt) + [(.[$m].pending.latest // [])[] | select(.alias as $a | ($lt | map(.alias) | index($a)) | not)]' <<< "$state")
+              state=$(jq -c --arg m "$major" --arg d "$now" --arg t "$dispatched_at" --argjson tg "$targets_json" --argjson lt "$merged_latest" \
                 '.[$m] = ((.[$m] // {}) + {pending: {digest: $d, dispatched_at: $t, targets: $tg, latest: $lt}})' <<< "$state")
             done < <(awk '{print $1}' /tmp/dispatched.txt | sort -u)
           else
