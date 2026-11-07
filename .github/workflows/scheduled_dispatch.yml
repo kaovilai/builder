@@ -50,6 +50,9 @@ jobs:
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
     steps:
+      - name: add checkout action...
+        uses: actions/checkout@v6
+
       - name: Check version availability and dispatch builds
         run: |
           set -euo pipefail

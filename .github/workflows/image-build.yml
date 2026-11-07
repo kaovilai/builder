@@ -231,7 +231,7 @@ jobs:
       - name: upload digest...
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ env.PLATFORM_PAIR }}-${{ env.VERSION_SAFE }}
+          name: digests-${{ env.CACHE_SCOPE }}-${{ env.PLATFORM_PAIR }}-${{ env.VERSION_SAFE }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -239,6 +239,10 @@ jobs:
   merge:
     runs-on: ubuntu-latest
     needs: [determine-versions, build]
+    env:
+      # Reusable-workflow calls share the caller run's artifact namespace:
+      # names must carry the variant so concurrent variants don't collide.
+      CACHE_SCOPE: ${{ inputs.flavor == 'fips' && format('ubi{0}-openssl-fips', inputs.ubi) || format('ubi{0}', inputs.ubi) }}
     # Skip the publish-path merge on fork PRs (nothing was pushed).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
@@ -268,7 +272,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
-          pattern: digests-*-${{ env.VERSION_SAFE }}
+          pattern: digests-${{ env.CACHE_SCOPE }}-*-${{ env.VERSION_SAFE }}
           merge-multiple: true
 
       - name: wait for image digests...

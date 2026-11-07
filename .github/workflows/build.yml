@@ -40,7 +40,10 @@ on:
 permissions: {}
 
 concurrency:
-  group: build-${{ github.event_name }}-${{ github.ref }}
+  # Dispatches must not share a group: GitHub keeps one running + one
+  # pending per group, so a shared group would collapse the dispatcher's
+  # per-variant batch. Push/PR runs share per-ref as before.
+  group: build-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && format('{0}-{1}', inputs.ubi, inputs.flavor) || github.ref }}
   cancel-in-progress: false
 
 jobs:
