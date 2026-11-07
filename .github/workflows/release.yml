@@ -45,7 +45,7 @@ jobs:
             while :; do
               resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
                 "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
-              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest)"'
+              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest)"' | grep -v godev
               [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
               page=$((page + 1))
             done
@@ -122,7 +122,9 @@ jobs:
 
             sbom_dir=$(mktemp -d /tmp/sboms.XXXXXX)
             while IFS=$'\t' read -r _ f d t; do
-              image="quay.io/konveyor/builder:${t}"
+              # scan by digest: the tag is mutable and could be re-published
+              # between selection and scan, making SBOM and notes disagree
+              image="quay.io/konveyor/builder@${d}"
               docker run --rm -v "${sbom_dir}:/out" docker.io/anchore/syft:1.33.0 \
                 scan "$image" -o spdx-json --file "/out/${f}.spdx.json" >/dev/null
             done <<< "$entries"

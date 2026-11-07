@@ -41,7 +41,7 @@ jobs:
             while :; do
               resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
                 "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
-              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest)"'
+              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest)"' | grep -v godev
               [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
               page=$((page + 1))
             done
@@ -123,7 +123,7 @@ jobs:
 
           # 2. Deep FIPS probe (native module images only): approved crypto
           #    works under fips140=only, non-approved crypto is rejected.
-          if [ "${{ matrix.fips_probe }}" = "True" ]; then
+          if [ "${{ matrix.fips_probe }}" = "true" ]; then
             echo "running FIPS engagement probe (fips140=only) ..."
 
             docker run --rm \
@@ -201,7 +201,7 @@ jobs:
           cd /tmp && go run probe.go' | grep -q 'control ok' \
               || { echo "FAIL: control probe (RSA-1024 with fips140=off) did not pass"; exit 1; }
             echo "FIPS enforcement verified: approved crypto works, non-approved rejected under fips140=only"
-          elif [ "${{ matrix.fips }}" = "True" ]; then
+          elif [ "${{ matrix.fips }}" = "true" ]; then
             echo "openssl-fips flavor (pre-1.27): version assertion only"
           fi
 

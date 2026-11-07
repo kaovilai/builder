@@ -24,7 +24,7 @@ jobs:
 
       - name: run actionlint...
         # The ignored shellcheck codes are deliberate repo patterns: ls | sort
-        # pipelines in the Dockerfile-derived variant enumerations, and
+        # pipelines in the variant enumerations, and
         # unquoted $(ls /tmp/digests) word-splitting when passing digest lists.
         run: |
           docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color \

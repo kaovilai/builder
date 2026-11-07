@@ -58,20 +58,86 @@ jobs:
           mkdir -p "$(dirname "$state_file")"
           [ -f "$state_file" ] || echo '{}' > "$state_file"
 
-          # UBI majors present in the repo, derived from the Dockerfiles.
-          majors=$(ls Dockerfile.ubi[0-9]* | sed -E 's/^Dockerfile\.ubi([0-9]+).*/\1/' | sort -nu)
+          # UBI majors present in the repo, from the variant registry.
+          majors=$(grep -vE '^[[:space:]]*(#|$)' variants.txt | awk '{print $1}' | sort -nu)
 
+          # Manifest-list digest of each ubiN:latest base. `docker manifest
+          # inspect --verbose` returns an array for multi-platform tags, so
+          # its per-platform `.Descriptor.digest` cannot be used here;
+          # imagetools prints the list digest directly.
           current='{}'
           for major in $majors; do
-            digest=$(docker manifest inspect --verbose "registry.access.redhat.com/ubi${major}:latest" | jq -r '.Descriptor.digest')
+            digest=$(docker buildx imagetools inspect "registry.access.redhat.com/ubi${major}:latest" --format '{{.Manifest.Digest}}')
             current=$(jq -c --arg m "$major" --arg d "$digest" '.[$m] = $d' <<< "$current")
           done
           echo "current base digests: $current"
 
+          # State maps each major to {applied: <digest>, pending: {digest,
+          # dispatched_at}}. `applied` advances only after a dispatched
+          # rebuild is confirmed published — a failed rebuild leaves the
+          # major pending and re-dispatched on the next run, instead of
+          # silently stranding it on a stale base forever.
+          state=$(cat "$state_file")
+          pending_majors=$(jq -r '[to_entries[] | select(.value.pending) | .key] | join(" ")' <<< "$state")
+
+          # Active tags with manifest digest and last-modified timestamp.
+          published_tags() {
+            local page=1 resp
+            while :; do
+              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
+                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
+              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest) \(.last_modified)"' | grep -v godev
+              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
+              page=$((page + 1))
+            done
+          }
+          # Newest publish time (unix seconds) per UBI major.
+          published_times() {
+            python3 - /tmp/tags.txt <<'PYEOF'
+          import re
+          import sys
+          from email.utils import parsedate_to_datetime
+
+          newest = {}
+          for line in open(sys.argv[1]):
+              # last_modified is RFC 1123 ("Thu, 05 Nov 2026 18:51:50 -0000"):
+              # split with maxsplit so its embedded spaces survive
+              parts = line.split(None, 2)
+              if len(parts) < 3:
+                  continue
+              name, when = parts[0], parsedate_to_datetime(parts[2].strip()).timestamp()
+              m = re.match(r"^ubi(\d+)", name)
+              if m:
+                  newest[m.group(1)] = max(newest.get(m.group(1), 0), when)
+          for major, when in sorted(newest.items()):
+              print(major, int(when))
+          PYEOF
+          }
+
+          needs_rebuild=""
+          if [ -n "$pending_majors" ]; then
+            # Confirm or retry previously dispatched rebuilds.
+            published_tags > /tmp/tags.txt
+            published_times > /tmp/published.tsv
+            for major in $pending_majors; do
+              pd=$(jq -r --arg m "$major" '.[$m].pending.digest // empty' <<< "$state")
+              pat=$(jq -r --arg m "$major" '.[$m].pending.dispatched_at // empty' <<< "$state")
+              pub=$(awk -v m="$major" '$1 == m {print $2}' /tmp/published.tsv)
+              if [ -n "$pub" ] && [ "$(date -d "$pat" +%s)" -lt "$pub" ]; then
+                echo "[ubi${major}] dispatched rebuild published; recording ${pd}"
+                state=$(jq -c --arg m "$major" --arg d "$pd" \
+                  '.[$m].applied = $d | .[$m] |= del(.pending)' <<< "$state")
+              else
+                echo "[ubi${major}] dispatched rebuild not published (build failed?); re-dispatching"
+                needs_rebuild="$needs_rebuild $major"
+              fi
+            done
+          fi
+
           drifted=""
           for major in $majors; do
             now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
-            prev=$(jq -r --arg m "$major" '.[$m] // empty' "$state_file")
+            prev=$(jq -r --arg m "$major" '.[$m].applied // empty' <<< "$state")
             if [ -z "$prev" ]; then
               echo "[ubi${major}] no recorded digest (bootstrap); recording ${now}"
             elif [ "$prev" != "$now" ]; then
@@ -82,22 +148,17 @@ jobs:
             fi
           done
 
-          if [ -n "$drifted" ] || [ "${FORCE}" = "true" ]; then
-            # Every currently-shipped version of the drifted variants:
+          # force rebuilds every shipped version regardless of drift, so the
+          # target set is all majors — not just the drifted ones
+          [ "${FORCE}" = "true" ] && drifted="$majors"
+          needs_rebuild="${needs_rebuild} ${drifted}"
+
+          if [ -n "${needs_rebuild// /}" ]; then
+            # Every currently-shipped version of the affected variants:
             # published tags grouped by manifest digest, per variant family
             # the newest patch of each of the two newest minor versions.
-            published_tags() {
-              local page=1 resp
-              while :; do
-                resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
-                  "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
-                echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest)"'
-                [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
-                page=$((page + 1))
-              done
-            }
-            published_tags > /tmp/tags.txt
-            targets=$(python3 - "$drifted" /tmp/tags.txt <<'PYEOF'
+            [ -f /tmp/tags.txt ] || published_tags > /tmp/tags.txt
+            targets=$(python3 - "${needs_rebuild}" /tmp/tags.txt <<'PYEOF'
           import re
           import sys
           from collections import defaultdict
@@ -106,7 +167,8 @@ jobs:
 
           by_digest = {}
           for line in open(sys.argv[2]):
-              name, digest = line.split()
+              parts = line.split()
+              name, digest = parts[0], parts[1]
               by_digest.setdefault(digest, []).append(name)
 
           def family(n):
@@ -144,6 +206,7 @@ jobs:
                       print("%s %s %s %s" % (major, flavor, "LATEST" if newest else "%d.%d.%d" % v, tag))
           PYEOF
             )
+            dispatched=""
             while read -r major flavor version _; do
               [ -n "$major" ] || continue
               [ "$version" = "LATEST" ] && version=""
@@ -154,24 +217,43 @@ jobs:
               else
                 echo "  dispatching build.yml (ubi=${major} flavor=${flavor} go_version='${version}')"
                 gh workflow run build.yml -f ubi="${major}" -f flavor="${flavor}" -f go_version="${version}"
+                dispatched="$dispatched $major"
               fi
             done <<< "$targets"
+
+            # Mark dispatched majors pending publish confirmation (cleared
+            # by the check above once the rebuild lands on quay).
+            dispatched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            for major in $(printf '%s\n' $dispatched | sort -u); do
+              now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
+              state=$(jq -c --arg m "$major" --arg d "$now" --arg t "$dispatched_at" \
+                '.[$m] = ((.[$m] // {}) + {pending: {digest: $d, dispatched_at: $t}})' <<< "$state")
+            done
           else
             echo "No base image drift; nothing to rebuild."
           fi
 
-          # Record the observed digests (also on bootstrap and dry runs so the
-          # next real run compares against them... but never on dry runs: the
-          # state must only advance when rebuilds were actually dispatched.
+          # Record the state (bootstrap digests, confirmed rebuilds, pending
+          # markers) — but never on dry runs: the state must only advance
+          # when rebuilds were actually dispatched.
           if [ "${DRY_RUN}" = "true" ]; then
-            echo "[dry-run] would record base digests: $current"
+            echo "[dry-run] would record state: $state"
             exit 0
           fi
           if [ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
-            echo "[skip: not on ${DEFAULT_BRANCH}] would record base digests"
+            echo "[skip: not on ${DEFAULT_BRANCH}] would record state"
             exit 0
           fi
-          jq . <<< "$current" > "$state_file"
+          # bootstrap majors that had no state yet
+          for major in $majors; do
+            has=$(jq -r --arg m "$major" '.[$m].applied // empty' <<< "$state")
+            if [ -z "$has" ]; then
+              now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
+              state=$(jq -c --arg m "$major" --arg d "$now" \
+                '.[$m] = ((.[$m] // {}) + {applied: $d})' <<< "$state")
+            fi
+          done
+          jq . <<< "$state" > "$state_file"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$state_file"
