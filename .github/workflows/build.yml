@@ -51,6 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       variants: ${{ steps.set.outputs.variants }}
+      count: ${{ steps.set.outputs.count }}
     steps:
       - name: add checkout action...
         uses: actions/checkout@v6
@@ -85,7 +86,20 @@ jobs:
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             # Dispatch path selects its variant via the caller matrix gating.
-            :
+            # Validate the requested variant + version up front: a dispatch
+            # matching no variant would otherwise skip every matrix leg and
+            # silently do nothing, and a malformed go_version would waste a
+            # full multi-arch build before failing.
+            if ! grep -qxF "${{ inputs.ubi }} ${{ inputs.flavor }}" <<< "$all_variants"; then
+              echo "ERROR: no Dockerfile for ubi${{ inputs.ubi }} (${{ inputs.flavor }}); variants are:"
+              echo "$all_variants"
+              exit 1
+            fi
+            if [ -n "${{ inputs.go_version }}" ] \
+              && ! [[ "${{ inputs.go_version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "ERROR: go_version '${{ inputs.go_version }}' is not X.Y.Z"
+              exit 1
+            fi
           else
             # Push/pull_request: keep only variants whose files changed.
             # Shared-logic files (this workflow, image-build.yml) run all.
@@ -93,7 +107,12 @@ jobs:
               base="${{ github.event.pull_request.base.sha }}"
             else
               base="${{ github.event.before }}"
-              if [[ "$base" =~ ^0+$ ]]; then base="${{ github.event.pull_request.base.sha || 'HEAD^' }}"; fi
+              if [[ "$base" =~ ^0+$ ]]; then
+                # First push of a new branch (before = zeros): diff the whole
+                # branch, not just its last commit, so variants changed by
+                # earlier commits are still built.
+                base=$(git merge-base HEAD "origin/${{ github.event.repository.default_branch }}")
+              fi
             fi
             git diff --name-only "${base}" HEAD > /tmp/changed || git diff --name-only HEAD^ HEAD > /tmp/changed
             variants=$(
@@ -118,9 +137,15 @@ jobs:
 
           echo "variants: $variants"
           echo "variants=$variants" >> "$GITHUB_OUTPUT"
+          count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["include"]))' <<< "$variants")
+          echo "count=$count" >> "$GITHUB_OUTPUT"
 
   build:
     needs: changes
+    # A Dockerfile-removal-only change filters every variant out; an empty
+    # include array makes GitHub fail the run instead of skipping the job
+    # (probed live: zero matrix jobs = workflow failure).
+    if: needs.changes.outputs.count != '0'
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.changes.outputs.variants) }}

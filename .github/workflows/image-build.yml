@@ -326,13 +326,20 @@ jobs:
         if: github.event_name != 'pull_request'
         id: go_version_patch
         run: |
-          echo "patch_version=$(docker run --rm quay.io/konveyor/builder@${MANIFEST_DIGEST} go version | awk '{ print $3 }' | sed -e 's/^go//')" >> $GITHUB_ENV
+          set -euo pipefail
+          ver=$(docker run --rm quay.io/konveyor/builder@${MANIFEST_DIGEST} go version | awk '{ print $3 }' | sed -e 's/^go//')
+          # a failed docker run must not publish a bare "v" tag
+          [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ERROR: unexpected go version output: '$ver'"; exit 1; }
+          echo "patch_version=$ver" >> $GITHUB_ENV
 
       - name: get go version
         if: github.event_name != 'pull_request'
         id: go_version_minor
         run: |
-          echo "minor_version=$(docker run --rm quay.io/konveyor/builder@${MANIFEST_DIGEST} go version | awk '{ print $3 }' | sed -e 's/^go//' | awk -F '.' '{ print $1 "." $2}')" >> $GITHUB_ENV
+          set -euo pipefail
+          ver=$(docker run --rm quay.io/konveyor/builder@${MANIFEST_DIGEST} go version | awk '{ print $3 }' | sed -e 's/^go//' | awk -F '.' '{ print $1 "." $2}')
+          [[ "$ver" =~ ^[0-9]+\.[0-9]+$ ]] || { echo "ERROR: unexpected go version output: '$ver'"; exit 1; }
+          echo "minor_version=$ver" >> $GITHUB_ENV
 
       - name: create and push versioned multi-arch manifest...
         if: github.event_name != 'pull_request'
