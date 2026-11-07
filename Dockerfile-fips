@@ -1,6 +1,11 @@
 ARG UBI_MAJOR=9
 FROM registry.access.redhat.com/ubi${UBI_MAJOR}:latest as base
-# gcc + openssl-devel mandatory — CGO required for FIPS/OpenSSL linking
+# gcc: building the Go toolchain from source needs a C compiler.
+# openssl-devel: only required by the <=1.26 openssl-fips backend (CGO
+# linking, and consumers compiling FIPS apps against libcrypto inside this
+# image); the 1.27+ hostfips-release toolchain uses Go's native
+# crypto/fips140 module and does not link OpenSSL. Drop openssl-devel once
+# the openssl-fips minors age out of the two-minor support window.
 RUN dnf -y install go git make jq unzip \
         gcc gcc-c++ openssl-devel perl && \
     dnf clean all
