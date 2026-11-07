@@ -64,6 +64,12 @@ jobs:
 
       - name: Resolve variants to build
         id: set
+        env:
+          # inputs reach the script only through environment variables —
+          # never interpolated into shell source (template injection)
+          UBI: ${{ inputs.ubi }}
+          FLAVOR: ${{ inputs.flavor }}
+          GO_VERSION_INPUT: ${{ inputs.go_version }}
         run: |
           set -euo pipefail
           shopt -s inherit_errexit
@@ -93,14 +99,20 @@ jobs:
             # matching no variant would otherwise skip every matrix leg and
             # silently do nothing, and a malformed go_version would waste a
             # full multi-arch build before failing.
-            if ! grep -qxF "${{ inputs.ubi }} ${{ inputs.flavor }}" <<< "$all_variants"; then
-              echo "ERROR: ubi${{ inputs.ubi }} (${{ inputs.flavor }}) is not in variants.txt; variants are:"
+            # exact string comparison, not grep: a value containing a
+            # newline would otherwise be split into multiple patterns
+            found=""
+            while IFS= read -r line; do
+              if [ "$line" = "${UBI} ${FLAVOR}" ]; then found=1; break; fi
+            done <<< "$all_variants"
+            if [ -z "$found" ]; then
+              echo "ERROR: ubi${UBI} (${FLAVOR}) is not in variants.txt; variants are:"
               echo "$all_variants"
               exit 1
             fi
-            if [ -n "${{ inputs.go_version }}" ] \
-              && ! [[ "${{ inputs.go_version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "ERROR: go_version '${{ inputs.go_version }}' is not X.Y.Z"
+            if [ -n "$GO_VERSION_INPUT" ] \
+              && ! [[ "$GO_VERSION_INPUT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "ERROR: go_version '$GO_VERSION_INPUT' is not X.Y.Z"
               exit 1
             fi
           else

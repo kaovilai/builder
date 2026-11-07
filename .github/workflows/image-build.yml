@@ -312,16 +312,21 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: create and push multi-arch manifest...
+        env:
+          # matrix fields reach scripts via env, never shell interpolation
+          TAG_SUFFIX: ${{ matrix.tag_suffix }}
         run: |
           docker buildx imagetools create \
             ${{ github.event_name == 'pull_request' && '--dry-run' || '' }} \
-            -t quay.io/konveyor/builder:${PREFIX}latest${{ matrix.tag_suffix }} \
+            -t quay.io/konveyor/builder:${PREFIX}latest${TAG_SUFFIX} \
             $(printf 'quay.io/konveyor/builder@sha256:%s ' $(ls /tmp/digests))
 
       - name: get multi-arch manifest digest...
         if: github.event_name != 'pull_request'
+        env:
+          TAG_SUFFIX: ${{ matrix.tag_suffix }}
         run: |
-          digest=$(docker buildx imagetools inspect quay.io/konveyor/builder:${PREFIX}latest${{ matrix.tag_suffix }} --format '{{.Manifest.Digest}}')
+          digest=$(docker buildx imagetools inspect "quay.io/konveyor/builder:${PREFIX}latest${TAG_SUFFIX}" --format '{{.Manifest.Digest}}')
           echo "MANIFEST_DIGEST=$digest" >> $GITHUB_ENV
 
       - name: get go version

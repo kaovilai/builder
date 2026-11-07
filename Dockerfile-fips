@@ -1,11 +1,14 @@
 ARG UBI_MAJOR=9
 FROM registry.access.redhat.com/ubi${UBI_MAJOR}:latest as base
 # gcc: building the Go toolchain from source needs a C compiler.
-# openssl-devel: only required by the <=1.26 openssl-fips backend (CGO
-# linking, and consumers compiling FIPS apps against libcrypto inside this
-# image); the 1.27+ hostfips-release toolchain uses Go's native
-# crypto/fips140 module and does not link OpenSSL. Drop openssl-devel once
-# the openssl-fips minors age out of the two-minor support window.
+# openssl-devel: required by the <=1.26 openssl-fips backend (CGO linking,
+# and consumers compiling FIPS apps against libcrypto inside this image).
+# The 1.27+ hostfips-release toolchain uses Go's native crypto/fips140
+# module and does not link OpenSSL — but note RHEL's golang RPM (the
+# bootstrap toolchain) itself requires openssl-devel, so a conditional
+# install cannot remove it. Shipping it only for the openssl-fips backend
+# needs a multi-stage build that keeps the dnf `go` bootstrap out of the
+# final image.
 RUN dnf -y install go git make jq unzip \
         gcc gcc-c++ openssl-devel perl && \
     dnf clean all
