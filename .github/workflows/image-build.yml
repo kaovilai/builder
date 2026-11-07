@@ -1,0 +1,351 @@
+name: 'Reusable multi-arch image build'
+
+# Shared build machinery for every UBI variant. The per-variant trigger
+# workflows (ubiN_multi_arch_image_build.yml and their -openssl-fips
+# counterparts) call this with the UBI major and flavor; everything else —
+# version resolution, multi-platform builds, digest merge, tagging,
+# attestations, and post-publish dispatches — is identical across variants.
+#
+# Matrix entries are flavor-uniform so the build and merge jobs never branch
+# on flavor: {build_arg, version_safe, tag_suffix}, e.g.
+#   standard: {build_arg: "GO_VERSION=go1.26.10", version_safe: "1.26.10", tag_suffix: "1.26.10"}
+#   fips:     {build_arg: "FIPS_TAG=go1.26.10-1-openssl-fips", version_safe: "go1.26.10-1-openssl-fips", tag_suffix: "1.26.10"}
+# An empty tag_suffix means "latest" (the newest supported version).
+
+on:
+  workflow_call:
+    inputs:
+      ubi:
+        description: 'UBI major version (8, 9, 10, ...) — selects the Dockerfile and tag prefix'
+        required: true
+        type: string
+      flavor:
+        description: 'Image flavor: standard (go.dev toolchain) or fips (golang-fips toolchain)'
+        required: true
+        type: string
+      go_version:
+        description: 'Go version to build (X.Y.Z); empty builds latest'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  determine-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      build_matrix: ${{ steps.set-matrix.outputs.build_matrix }}
+    env:
+      UBI: ${{ inputs.ubi }}
+      FLAVOR: ${{ inputs.flavor }}
+      INPUT_VERSION: ${{ inputs.go_version }}
+    steps:
+      - name: Determine versions to build
+        id: set-matrix
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          if [ "$FLAVOR" = "fips" ]; then
+            # Fetch golang-fips/go releases (newest first from GitHub API)
+            # Uses gh api for authenticated requests (higher rate limit)
+            fips_releases=$(gh api repos/golang-fips/go/releases --paginate | jq -s 'add')
+
+            # FIPS tag selection (same rules as scheduled_dispatch.yml):
+            # - candidates: non-draft releases tagged go<version>-<build>-(openssl-fips|hostfips-release);
+            #   the pure-digit build segment excludes rc tags (e.g. go1.18.3-0.rc1-openssl-fips)
+            # - golang-fips ships Go 1.27+ FIPS via the native crypto/fips140 module
+            #   ("hostfips-release" tags); older minors keep "openssl-fips" tags
+            # - per minor: prefer the newest stable release, falling back to the newest
+            #   prerelease when that minor has no stable release yet
+            # - top 2 minor versions, matching Go's two-release support policy
+            JQ_FIPS='
+              def cands: [ .[] | select(.draft == false)
+                | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
+                | {tag: .tag_name, pre: .prerelease} ];
+              def vkey: (.tag | split("-")[0] | ltrimstr("go") | split(".") | map(tonumber));
+              def bkey: (.tag | split("-")[1] | tonumber);
+              def ossl: (if .tag | endswith("openssl-fips") then 1 else 0 end);
+              def best: max_by([ (if .pre then 0 else 1 end), vkey, bkey, ossl ]);
+            '
+            top2() {
+              echo "$fips_releases" | jq -c "${JQ_FIPS}"'
+                cands | group_by(vkey | .[0:2]) | sort_by(.[0] | vkey | .[0:2]) | reverse
+                | .[0:2] | map(best)
+              '
+            }
+
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              matrix=$(top2 | jq -c '
+                to_entries |
+                map({
+                  build_arg: ("FIPS_TAG=" + .value.tag),
+                  version_safe: (.value.tag | gsub("/"; "-")),
+                  tag_suffix: (if .key == 0 then "" else (.value.tag | split("-")[0] | ltrimstr("go")) end)
+                }) |
+                {include: .}
+              ')
+            else
+              if [ -n "$INPUT_VERSION" ]; then
+                # Find matching FIPS tag for provided Go version
+                fips_tag=$(echo "$fips_releases" | jq -r --arg v "go${INPUT_VERSION}" "${JQ_FIPS}"'
+                  cands | map(select(.tag | startswith($v + "-"))) | best | .tag // empty
+                ')
+                if [ -z "$fips_tag" ] || [ "$fips_tag" = "null" ]; then
+                  echo "ERROR: No golang-fips release found for go${INPUT_VERSION}"
+                  exit 1
+                fi
+                matrix=$(jq -nc --arg t "$fips_tag" --arg s "$INPUT_VERSION" \
+                  '{include: [{build_arg: ("FIPS_TAG=" + $t), version_safe: ($t | gsub("/"; "-")), tag_suffix: $s}]}')
+              else
+                # Empty input = latest (best release of the newest minor)
+                fips_tag=$(top2 | jq -r '.[0].tag')
+                if [ -z "$fips_tag" ] || [ "$fips_tag" = "null" ]; then
+                  echo "ERROR: No golang-fips releases matched the candidate filter"
+                  exit 1
+                fi
+                matrix=$(jq -nc --arg t "$fips_tag" \
+                  '{include: [{build_arg: ("FIPS_TAG=" + $t), version_safe: ($t | gsub("/"; "-")), tag_suffix: ""}]}')
+              fi
+            fi
+          else
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              # On pull_request, build latest (empty) plus all previous supported Go
+              # versions. Go supports two major releases at a time; the go.dev API
+              # returns one entry per supported release, so .[1:] is the previous
+              # supported version(s). The empty string builds the absolute latest
+              # via the Dockerfile.
+              versions=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 'https://go.dev/dl/?mode=json' | jq -r '[.[1:][].version | ltrimstr("go")] | .[]')
+              versions=$(printf '%s\n' "" "$versions")
+            else
+              # For workflow_dispatch or push use the provided input (or empty)
+              versions="$INPUT_VERSION"
+            fi
+            matrix=$(printf '%s\n' "$versions" | jq -Rsc '
+              split("\n") | .[:-1] |
+              map({
+                build_arg: ("GO_VERSION=go" + .),
+                version_safe: (if . == "" then "latest" else . end),
+                tag_suffix: .
+              }) | {include: .}
+            ')
+          fi
+
+          # Expand matrix with all target platforms for the build job
+          build_matrix=$(echo "$matrix" | jq -c '
+            .include |
+            [.[] | . as $item |
+              ["linux/amd64","linux/arm64","linux/ppc64le","linux/s390x"][] as $platform |
+              $item + {"platform": $platform}
+            ] |
+            {include: .}
+          ')
+
+          {
+            echo "matrix<<MATRIX_EOF"
+            echo "$matrix"
+            echo "MATRIX_EOF"
+          } >> $GITHUB_OUTPUT
+
+          {
+            echo "build_matrix<<MATRIX_EOF"
+            echo "$build_matrix"
+            echo "MATRIX_EOF"
+          } >> $GITHUB_OUTPUT
+
+  build:
+    needs: determine-versions
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    env:
+      # Fork PRs have no access to the Quay secrets: build without pushing.
+      CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      UBI: ${{ inputs.ubi }}
+      FLAVOR: ${{ inputs.flavor }}
+      DOCKERFILE: ${{ inputs.flavor == 'fips' && format('Dockerfile.ubi{0}-openssl-fips', inputs.ubi) || format('Dockerfile.ubi{0}', inputs.ubi) }}
+      CACHE_SCOPE: ${{ inputs.flavor == 'fips' && format('ubi{0}-openssl-fips', inputs.ubi) || format('ubi{0}', inputs.ubi) }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.determine-versions.outputs.build_matrix) }}
+    steps:
+      - name: Prepare
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+          echo "VERSION_SAFE=${{ matrix.version_safe }}" >> $GITHUB_ENV
+          case "${FLAVOR}:${UBI}" in
+            standard:8) prefix="" ;;
+            standard:*) prefix="ubi${UBI}-" ;;
+            fips:8)     prefix="openssl-fips-" ;;
+            fips:*)     prefix="ubi${UBI}-openssl-fips-" ;;
+          esac
+          echo "PREFIX=$prefix" >> $GITHUB_ENV
+
+      - name: add checkout action...
+        uses: actions/checkout@v6
+
+      - name: configure QEMU action...
+        if: matrix.platform == 'linux/ppc64le' || matrix.platform == 'linux/s390x'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: ${{ matrix.platform }}
+
+      - name: configure Docker Buildx...
+        id: docker_buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: login to Quay.io...
+        if: env.CAN_PUSH == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_PUBLISH_ROBOT }}
+          password: ${{ secrets.QUAY_PUBLISH_TOKEN }}
+
+      - name: build image and push by digest...
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./${{ env.DOCKERFILE }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=quay.io/konveyor/builder,push-by-digest=true,name-canonical=true,push=${{ env.CAN_PUSH }}
+          cache-from: type=gha,scope=${{ env.CACHE_SCOPE }}-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.CACHE_SCOPE }}-${{ env.PLATFORM_PAIR }}
+          provenance: false
+          build-args: ${{ matrix.build_arg }}
+
+      - name: export digest...
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: upload digest...
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}-${{ env.VERSION_SAFE }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: [determine-versions, build]
+    # Skip the publish-path merge on fork PRs (nothing was pushed).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      actions: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.determine-versions.outputs.matrix) }}
+    steps:
+      - name: Prepare
+        env:
+          UBI: ${{ inputs.ubi }}
+          FLAVOR: ${{ inputs.flavor }}
+        run: |
+          echo "VERSION_SAFE=${{ matrix.version_safe }}" >> $GITHUB_ENV
+          case "${FLAVOR}:${UBI}" in
+            standard:8) prefix="" ;;
+            standard:*) prefix="ubi${UBI}-" ;;
+            fips:8)     prefix="openssl-fips-" ;;
+            fips:*)     prefix="ubi${UBI}-openssl-fips-" ;;
+          esac
+          echo "PREFIX=$prefix" >> $GITHUB_ENV
+
+      - name: download digests...
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*-${{ env.VERSION_SAFE }}
+          merge-multiple: true
+
+      - name: wait for image digests...
+        run: |
+          set -euo pipefail
+
+          for digest in /tmp/digests/*; do
+            digest="sha256:$(basename "$digest")"
+
+            for attempt in {1..6}; do
+              if docker buildx imagetools inspect \
+                "quay.io/konveyor/builder@${digest}" >/dev/null 2>&1; then
+                break
+              fi
+
+              if [ "$attempt" -eq 6 ]; then
+                echo "Digest unavailable after retries: ${digest}"
+                exit 1
+              fi
+
+              echo "Waiting for Quay to expose ${digest} (attempt ${attempt}/6)"
+              sleep 10
+            done
+          done
+
+      - name: login to Quay.io...
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_PUBLISH_ROBOT }}
+          password: ${{ secrets.QUAY_PUBLISH_TOKEN }}
+
+      - name: configure Docker Buildx...
+        uses: docker/setup-buildx-action@v4
+
+      - name: create and push multi-arch manifest...
+        run: |
+          docker buildx imagetools create \
+            ${{ github.event_name == 'pull_request' && '--dry-run' || '' }} \
+            -t quay.io/konveyor/builder:${PREFIX}latest${{ matrix.tag_suffix }} \
+            $(printf 'quay.io/konveyor/builder@sha256:%s ' $(ls /tmp/digests))
+
+      - name: get multi-arch manifest digest...
+        if: github.event_name != 'pull_request'
+        run: |
+          digest=$(docker buildx imagetools inspect quay.io/konveyor/builder:${PREFIX}latest${{ matrix.tag_suffix }} --format '{{.Manifest.Digest}}')
+          echo "MANIFEST_DIGEST=$digest" >> $GITHUB_ENV
+
+      - name: get go version
+        if: github.event_name != 'pull_request'
+        id: go_version_patch
+        run: |
+          echo "patch_version=$(docker run --rm quay.io/konveyor/builder@${MANIFEST_DIGEST} go version | awk '{ print $3 }' | sed -e 's/^go//')" >> $GITHUB_ENV
+
+      - name: get go version
+        if: github.event_name != 'pull_request'
+        id: go_version_minor
+        run: |
+          echo "minor_version=$(docker run --rm quay.io/konveyor/builder@${MANIFEST_DIGEST} go version | awk '{ print $3 }' | sed -e 's/^go//' | awk -F '.' '{ print $1 "." $2}')" >> $GITHUB_ENV
+
+      - name: create and push versioned multi-arch manifest...
+        if: github.event_name != 'pull_request'
+        run: |
+          docker buildx imagetools create \
+            -t quay.io/konveyor/builder:${PREFIX}v${{ env.minor_version }} \
+            -t quay.io/konveyor/builder:${PREFIX}v${{ env.patch_version }} \
+            $(printf 'quay.io/konveyor/builder@sha256:%s ' $(ls /tmp/digests))
+
+      - name: generate artifact attestation...
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-name: quay.io/konveyor/builder
+          subject-digest: ${{ env.MANIFEST_DIGEST }}
+          subject-version: v${{ env.patch_version }}
+          push-to-registry: true
+
+      - name: refresh README version badges and submit image SBOMs...
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh workflow run readme-badges.yml
+          gh workflow run submit-sboms.yml

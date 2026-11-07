@@ -171,7 +171,15 @@ jobs:
           def write(p, t):
               pathlib.Path(p).write_text(t)
 
-          # 1. Derive new files from the newest existing major.
+          # 1. Derive new files from the newest existing major. The workflow
+          # files are thin callers of image-build.yml, so besides the ubi{N}
+          # path references they carry the major in the `ubi:` input and the
+          # workflow name.
+          def derive(t):
+              return (t.replace(f"ubi{src}", f"ubi{n}")
+                      .replace(f"ubi: '{src}'", f"ubi: '{n}'")
+                      .replace(f"UBI {src}", f"UBI {n}"))
+
           for a, b in [
               (f"Dockerfile.ubi{src}", f"Dockerfile.ubi{n}"),
               (f"Dockerfile.ubi{src}-openssl-fips", f"Dockerfile.ubi{n}-openssl-fips"),
@@ -180,7 +188,7 @@ jobs:
               (f".github/workflows/ubi{src}_openssl_fips_multi_arch_image_build.yml",
                f".github/workflows/ubi{n}_openssl_fips_multi_arch_image_build.yml"),
           ]:
-              write(b, read(a).replace(f"ubi{src}", f"ubi{n}"))
+              write(b, derive(read(a)))
 
           def insert_after(path, needle, new_line):
               lines = read(path).splitlines(keepends=True)
