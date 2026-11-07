@@ -499,6 +499,40 @@ jobs:
             -t quay.io/konveyor/builder:${PREFIX}v${{ env.patch_version }} \
             $(printf 'quay.io/konveyor/builder@sha256:%s ' $(ls /tmp/digests))
 
+      - name: verify the published artifact...
+        # Pull the artifact back the way a consumer would: e2e validated a
+        # locally built image, this validates what was actually pushed —
+        # every tag resolves to the same manifest, the manifest resolves
+        # for every platform we build, and the image runs the Go version
+        # its tag claims.
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          img=quay.io/konveyor/builder
+          patch_tag="${PREFIX}v${patch_version}"
+          minor_tag="${PREFIX}v${minor_version}"
+
+          manifest_digest=$(docker buildx imagetools inspect "${img}:${patch_tag}" --format '{{.Manifest.Digest}}')
+          platforms=$(docker buildx imagetools inspect "${img}:${patch_tag}" \
+            --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}')
+          for p in linux/amd64 linux/arm64 linux/ppc64le linux/s390x; do
+            grep -qw "$p" <<< "$platforms" \
+              || { echo "ERROR: $p missing from ${img}:${patch_tag} (platforms: $platforms)"; exit 1; }
+          done
+
+          for tag in "$minor_tag" "$patch_tag"; do
+            d=$(docker buildx imagetools inspect "${img}:${tag}" --format '{{.Manifest.Digest}}')
+            [ "$d" = "$manifest_digest" ] \
+              || { echo "ERROR: ${img}:${tag} resolves to $d, expected $manifest_digest"; exit 1; }
+          done
+          [ "$manifest_digest" = "$MANIFEST_DIGEST" ] \
+            || { echo "ERROR: pushed manifest $manifest_digest differs from built $MANIFEST_DIGEST"; exit 1; }
+
+          got=$(docker run --rm "${img}:${patch_tag}" go version | awk '{ print $3 }' | sed 's/^go//')
+          [ "$got" = "$patch_version" ] \
+            || { echo "ERROR: ${img}:${patch_tag} reports go${got}, expected go${patch_version}"; exit 1; }
+          echo "published artifact verified: 4 platforms, all tags on ${manifest_digest}, go${got} runs"
+
       - name: generate artifact attestation...
         if: github.event_name != 'pull_request'
         uses: actions/attest@v4
