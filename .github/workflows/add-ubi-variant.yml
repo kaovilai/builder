@@ -50,7 +50,7 @@ jobs:
       FORCE_MAJOR: ${{ github.event_name == 'workflow_dispatch' && inputs.force_major || '' }}
     steps:
       - name: add checkout action...
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Detect new UBI major and generate variant
         run: |

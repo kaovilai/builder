@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: add checkout action...
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: run actionlint...
         # The ignored shellcheck codes are deliberate repo patterns: ls | sort

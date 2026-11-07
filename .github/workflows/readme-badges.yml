@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: add checkout action...
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # Always the default-branch tip at run start: queued workflow_dispatch
           # runs otherwise check out the commit snapshotted at dispatch time, and

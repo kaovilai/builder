@@ -47,7 +47,7 @@ jobs:
       FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}
     steps:
       - name: add checkout action...
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # quay push credentials for re-pointing canonical latest aliases after
       # confirmed rebuilds (explicit-version builds only publish the
