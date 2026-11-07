@@ -120,6 +120,9 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       actions: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.determine-versions.outputs.matrix) }}
@@ -196,6 +199,19 @@ jobs:
             -t quay.io/konveyor/builder:ubi9-v${{ env.minor_version }} \
             -t quay.io/konveyor/builder:ubi9-v${{ env.patch_version }} \
             $(printf 'quay.io/konveyor/builder@sha256:%s ' $(ls /tmp/digests))
+
+      - name: get multi-arch manifest digest...
+        if: github.event_name != 'pull_request'
+        run: echo "MANIFEST_DIGEST=$(docker buildx imagetools inspect quay.io/konveyor/builder:ubi9-latest${{ matrix.go_version }} --format '{{.Manifest.Digest}}')" >> $GITHUB_ENV
+
+      - name: generate artifact attestation...
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-name: quay.io/konveyor/builder
+          subject-digest: ${{ env.MANIFEST_DIGEST }}
+          subject-version: v${{ env.patch_version }}
+          push-to-registry: true
 
       - name: refresh README version badges and submit image SBOMs...
         if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
