@@ -1,0 +1,31 @@
+name: 'Workflow lint'
+
+# Lints .github/workflows with actionlint — catches invalid workflow files
+# (syntax, unavailable contexts like matrix in a job-level if, schema
+# violations) before they cost a CI cycle.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+  push:
+    paths:
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: add checkout action...
+        uses: actions/checkout@v6
+
+      - name: run actionlint...
+        # The ignored shellcheck codes are deliberate repo patterns: ls | sort
+        # pipelines in the Dockerfile-derived variant enumerations, and
+        # unquoted $(ls /tmp/digests) word-splitting when passing digest lists.
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color \
+            -ignore 'shellcheck reported issue in this script: SC(2010|2012|2046|2086)'

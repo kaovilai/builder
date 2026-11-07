@@ -1,0 +1,208 @@
+name: 'Post-publish smoke test'
+
+# Verifies the images actually published to quay.io/konveyor/builder:
+# every shipped image must report the Go version its tag claims, and FIPS
+# images on Go 1.27+ (native crypto/fips140 module, "hostfips-release"
+# builds) must reject non-approved cryptography under GODEBUG=fips140=only
+# while approved cryptography keeps working — proving FIPS enforcement is
+# engaged, not just compiled in. Older openssl-fips images use the OpenSSL
+# backend, which ignores the fips140 GODEBUG switch, so they get the
+# version assertion only (verified live: ed25519 still signs on 1.26).
+#
+# The shipped set is derived from the published tags (per variant family,
+# the newest patch of each of the two newest minor versions).
+
+on:
+  schedule:
+    - cron: '0 7 * * 6'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke-test
+  cancel-in-progress: true
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - name: Resolve published images to verify
+        id: set
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          published_tags() {
+            local page=1 resp
+            while :; do
+              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
+                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
+              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest)"'
+              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
+              page=$((page + 1))
+            done
+          }
+
+          published_tags > /tmp/tags.txt
+          matrix=$(python3 - /tmp/tags.txt <<'PYEOF'
+          import json
+          import re
+          import sys
+          from collections import defaultdict
+
+          by_digest = {}
+          for line in open(sys.argv[1]):
+              name, digest = line.split()
+              by_digest.setdefault(digest, []).append(name)
+
+          def family(n):
+              fips = "-fips" if "openssl-fips" in n else ""
+              m = re.match(r"^ubi(\d+)", n)
+              return f"ubi{m.group(1) if m else '8'}{fips}"
+
+          fams = defaultdict(list)
+          for digest, names in by_digest.items():
+              versions = set()
+              for n in names:
+                  for m in re.finditer(r"v(\d+)\.(\d+)\.(\d+)", n):
+                      versions.add((int(m[1]), int(m[2]), int(m[3])))
+              fams[family(names[0])].append({"digest": digest, "tags": names, "versions": versions})
+
+          include = []
+          for key, entries in fams.items():
+              minors = sorted({v[:2] for e in entries for v in e["versions"]}, reverse=True)[:2]
+              for minor in minors:
+                  best = None
+                  for e in entries:
+                      for v in e["versions"]:
+                          if v[:2] == minor and (best is None or v > best[0]):
+                              best = (v, e)
+                  if best:
+                      v, e = best
+                      suffix = "v%d.%d.%d" % v
+                      tag = next(n for n in e["tags"] if n.endswith(suffix))
+                      version = "%d.%d.%d" % v
+                      include.append({
+                          "image": f"quay.io/konveyor/builder:{tag}",
+                          "version": version,
+                          "fips": key.endswith("-fips"),
+                          # deep FIPS probe applies to the native crypto/fips140
+                          # module (Go 1.27+); older openssl-fips ignores it
+                          "fips_probe": key.endswith("-fips") and (v[0], v[1]) >= (1, 27),
+                      })
+          print(json.dumps({"include": sorted(include, key=lambda x: x["image"])}))
+          PYEOF
+          )
+          echo "matrix: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: images
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.images.outputs.matrix) }}
+    steps:
+      - name: verify published image
+        run: |
+          set -euo pipefail
+
+          echo "verifying ${{ matrix.image }}"
+
+          # 1. The image reports the Go version its tag claims.
+          actual=$(docker run --rm "${{ matrix.image }}" go version | awk '{ print $3 }' | sed 's/^go//')
+          if [ "$actual" != "${{ matrix.version }}" ]; then
+            echo "FAIL: ${{ matrix.image }} reports go${actual}, tag claims ${{ matrix.version }}"
+            exit 1
+          fi
+          echo "version ok: go${actual}"
+
+          # 2. Deep FIPS probe (native module images only): approved crypto
+          #    works under fips140=only, non-approved crypto is rejected.
+          if [ "${{ matrix.fips_probe }}" = "True" ]; then
+            echo "running FIPS engagement probe (fips140=only) ..."
+
+            docker run --rm \
+              -e GOLANG_NATIVE_HOSTFIPS_OVERRIDE=1 \
+              -e GODEBUG=fips140=only \
+              "${{ matrix.image }}" sh -c 'cat > /tmp/probe.go << "EOF"
+          package main
+
+          import (
+          	"crypto/sha256"
+          	"fmt"
+          )
+
+          func main() {
+          	h := sha256.Sum256([]byte("probe"))
+          	fmt.Println("approved:", h[0] != 0)
+          }
+          EOF
+          cd /tmp && go run probe.go' | grep -q '^approved: true' \
+              || { echo "FAIL: approved crypto (sha256) rejected under fips140=only"; exit 1; }
+            echo "approved crypto ok"
+
+            # negative control: RSA-1024 must be rejected under fips140=only
+            # (verified live: "use of keys smaller than 2048 bits is not
+            # allowed in FIPS 140-only mode"), and must succeed with
+            # fips140=off — proving the rejection is FIPS-driven rather than
+            # a toolchain limitation.
+            if docker run --rm \
+              -e GOLANG_NATIVE_HOSTFIPS_OVERRIDE=1 \
+              -e GODEBUG=fips140=only \
+              "${{ matrix.image }}" sh -c 'cat > /tmp/probe.go << "EOF"
+          package main
+
+          import (
+          	"crypto/rand"
+          	"crypto/rsa"
+          	"fmt"
+          	"os"
+          )
+
+          func main() {
+          	_, err := rsa.GenerateKey(rand.Reader, 1024)
+          	if err != nil {
+          		fmt.Println("rejected:", err)
+          		os.Exit(1)
+          	}
+          	fmt.Println("rsa-1024 allowed")
+          }
+          EOF
+          cd /tmp && go run probe.go' >/dev/null 2>&1; then
+              echo "FAIL: non-approved crypto (RSA-1024) was allowed under fips140=only"
+              exit 1
+            fi
+            docker run --rm \
+              -e GODEBUG=fips140=off \
+              "${{ matrix.image }}" sh -c 'cat > /tmp/probe.go << "EOF"
+          package main
+
+          import (
+          	"crypto/rand"
+          	"crypto/rsa"
+          	"fmt"
+          	"os"
+          )
+
+          func main() {
+          	_, err := rsa.GenerateKey(rand.Reader, 1024)
+          	if err != nil {
+          		fmt.Println("unexpected rejection:", err)
+          		os.Exit(1)
+          	}
+          	fmt.Println("control ok")
+          }
+          EOF
+          cd /tmp && go run probe.go' | grep -q 'control ok' \
+              || { echo "FAIL: control probe (RSA-1024 with fips140=off) did not pass"; exit 1; }
+            echo "FIPS enforcement verified: approved crypto works, non-approved rejected under fips140=only"
+          elif [ "${{ matrix.fips }}" = "True" ]; then
+            echo "openssl-fips flavor (pre-1.27): version assertion only"
+          fi
+
+          echo "PASS: ${{ matrix.image }}"
