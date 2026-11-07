@@ -169,7 +169,7 @@ jobs:
       CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       UBI: ${{ inputs.ubi }}
       FLAVOR: ${{ inputs.flavor }}
-      DOCKERFILE: ${{ inputs.flavor == 'fips' && 'Dockerfile-openssl-fips' || 'Dockerfile' }}
+      DOCKERFILE: ${{ inputs.flavor == 'fips' && 'Dockerfile-fips' || 'Dockerfile' }}
       CACHE_SCOPE: ${{ inputs.flavor == 'fips' && format('ubi{0}-openssl-fips', inputs.ubi) || format('ubi{0}', inputs.ubi) }}
     strategy:
       fail-fast: false
