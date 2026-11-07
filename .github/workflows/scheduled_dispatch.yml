@@ -58,22 +58,26 @@ jobs:
           # tag list and the dispatcher would act on incomplete data.
           shopt -s inherit_errexit
 
-          # --- Standard (non-FIPS) image variants ---------------------------------
-          # Maps a UBI variant to its published quay tag prefix and its build workflow.
-          declare -A NONFIPS_PREFIX=( [ubi8]="" [ubi9]="ubi9-" [ubi10]="ubi10-" )
-          declare -A NONFIPS_WF=(
-            [ubi8]="ubi8_multi_arch_image_build.yml"
-            [ubi9]="ubi9_multi_arch_image_build.yml"
-            [ubi10]="ubi10_multi_arch_image_build.yml"
-          )
+          # --- Image variants ------------------------------------------------------
+          # Variants are derived from the Dockerfiles present in the repo, so a
+          # new variant needs no dispatcher registration. Each dispatches the
+          # shared build.yml workflow with its ubi/flavor; expected tag prefixes
+          # follow the published scheme (ubi8 unprefixed, ubi9/ubi10 prefixed).
+          variants=$(ls Dockerfile.ubi[0-9]* 2>/dev/null | while read -r df; do
+            case "$df" in
+              *-openssl-fips) echo "${df#Dockerfile.ubi} fips" ;;
+              *)              echo "${df#Dockerfile.ubi} standard" ;;
+            esac
+          done | sed 's/-openssl-fips//' | sort -n)
 
-          # --- OpenSSL FIPS image variants ----------------------------------------
-          declare -A FIPS_PREFIX=( [ubi8]="openssl-fips-" [ubi9]="ubi9-openssl-fips-" [ubi10]="ubi10-openssl-fips-" )
-          declare -A FIPS_WF=(
-            [ubi8]="ubi8_openssl_fips_multi_arch_image_build.yml"
-            [ubi9]="ubi9_openssl_fips_multi_arch_image_build.yml"
-            [ubi10]="ubi10_openssl_fips_multi_arch_image_build.yml"
-          )
+          variant_prefix() {
+            case "$1:$2" in
+              standard:8) echo "" ;;
+              standard:*) echo "ubi$1-" ;;
+              fips:8)     echo "openssl-fips-" ;;
+              fips:*)     echo "ubi$1-openssl-fips-" ;;
+            esac
+          }
 
           # Collect all active tags published to quay.io/konveyor/builder.
           published_tags() {
@@ -93,15 +97,15 @@ jobs:
           tag_published() { grep -qxF "$1" <<< "$PUBLISHED_TAGS"; }
 
           dispatch() {
-            # $1 = workflow file, $2 = go_version input
-            local wf="$1" input="$2"
+            # $1 = ubi major, $2 = flavor, $3 = go_version input
+            local ubi="$1" flavor="$2" input="$3"
             if [ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
-              echo "  [skip: not on ${DEFAULT_BRANCH}] would dispatch ${wf} (go_version='${input}')"
+              echo "  [skip: not on ${DEFAULT_BRANCH}] would dispatch build.yml (ubi=${ubi} flavor=${flavor} go_version='${input}')"
             elif [ "${DRY_RUN}" = "true" ]; then
-              echo "  [dry-run] would dispatch ${wf} (go_version='${input}')"
+              echo "  [dry-run] would dispatch build.yml (ubi=${ubi} flavor=${flavor} go_version='${input}')"
             else
-              echo "  dispatching ${wf} (go_version='${input}')"
-              gh workflow run "${wf}" -f go_version="${input}"
+              echo "  dispatching build.yml (ubi=${ubi} flavor=${flavor} go_version='${input}')"
+              gh workflow run build.yml -f ubi="${ubi}" -f flavor="${flavor}" -f go_version="${input}"
             fi
           }
 
@@ -117,15 +121,16 @@ jobs:
           for idx in "${!GO_VERSIONS[@]}"; do
             ver="${GO_VERSIONS[$idx]}"
             if [ "$idx" -eq 0 ]; then input=""; else input="$ver"; fi
-            for ubi in ubi8 ubi9 ubi10; do
-              expected="${NONFIPS_PREFIX[$ubi]}v${ver}"
+            while read -r ubi flavor; do
+              [ "$flavor" = "standard" ] || continue
+              expected="$(variant_prefix "$ubi" "$flavor")v${ver}"
               if tag_published "$expected"; then
-                echo "[$ubi] $expected already published, skipping"
+                echo "[ubi${ubi}] $expected already published, skipping"
               else
-                echo "[$ubi] $expected not published, newer version available"
-                dispatch "${NONFIPS_WF[$ubi]}" "$input"
+                echo "[ubi${ubi}] $expected not published, newer version available"
+                dispatch "$ubi" "$flavor" "$input"
               fi
-            done
+            done <<< "$variants"
           done
 
           # ------------------------------------------------------------------------
@@ -160,15 +165,16 @@ jobs:
             idx="${entry%% *}"
             ver="${entry#* }"
             if [ "$idx" -eq 0 ]; then input=""; else input="$ver"; fi
-            for ubi in ubi8 ubi9 ubi10; do
-              expected="${FIPS_PREFIX[$ubi]}v${ver}"
+            while read -r ubi flavor; do
+              [ "$flavor" = "fips" ] || continue
+              expected="$(variant_prefix "$ubi" "$flavor")v${ver}"
               if tag_published "$expected"; then
-                echo "[$ubi-fips] $expected already published, skipping"
+                echo "[ubi${ubi}-fips] $expected already published, skipping"
               else
-                echo "[$ubi-fips] $expected not published, newer version available"
-                dispatch "${FIPS_WF[$ubi]}" "$input"
+                echo "[ubi${ubi}-fips] $expected not published, newer version available"
+                dispatch "$ubi" "$flavor" "$input"
               fi
-            done
+            done <<< "$variants"
           done
 
       - name: Refresh README version badges

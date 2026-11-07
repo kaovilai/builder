@@ -1,0 +1,137 @@
+name: 'Multi-arch image build'
+
+# Single trigger workflow for every UBI variant. Push and pull_request runs
+# derive the variant list from the Dockerfiles in the repo and filter it to
+# the variants whose files changed (shared-logic changes run everything);
+# workflow_dispatch (used by scheduled_dispatch.yml) selects one variant via
+# the ubi/flavor inputs. The build machinery lives in image-build.yml.
+#
+# Per-leg gating is computed in the `with:` expression — a job-level `if`
+# cannot reference the matrix context (verified live: invalid workflow
+# file) — and passed to the reusable workflow as its `run` input.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ubi:
+        description: 'UBI major version to build (8, 9, 10, ...)'
+        required: true
+        type: string
+      flavor:
+        description: 'Image flavor: standard or fips'
+        required: true
+        type: string
+      go_version:
+        description: 'Go version to build (X.Y.Z); empty builds latest'
+        required: false
+        type: string
+        default: ''
+  push:
+    paths:
+      - 'Dockerfile.ubi*'
+      - '.github/workflows/build.yml'
+      - '.github/workflows/image-build.yml'
+  pull_request:
+    paths:
+      - 'Dockerfile.ubi*'
+      - '.github/workflows/build.yml'
+      - '.github/workflows/image-build.yml'
+
+permissions: {}
+
+concurrency:
+  group: build-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      variants: ${{ steps.set.outputs.variants }}
+    steps:
+      - name: add checkout action...
+        uses: actions/checkout@v6
+        with:
+          # full history so the event's base commit is available for diffing
+          fetch-depth: 0
+
+      - name: Resolve variants to build
+        id: set
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          # Variants are derived from the Dockerfiles present in the repo.
+          all_variants=$(ls Dockerfile.ubi[0-9]* | while read -r df; do
+            case "$df" in
+              *-openssl-fips) echo "${df#Dockerfile.ubi} fips" ;;
+              *)              echo "${df#Dockerfile.ubi} standard" ;;
+            esac
+          done | sed 's/-openssl-fips//' | sort -n)
+
+          variants=$(
+            echo "$all_variants" | python3 -c '
+          import json, sys
+          include = []
+          for line in sys.stdin:
+              ubi, flavor = line.split()
+              include.append({"ubi": ubi, "flavor": flavor})
+          print(json.dumps({"include": include}))
+          '
+          )
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Dispatch path selects its variant via the caller matrix gating.
+            :
+          else
+            # Push/pull_request: keep only variants whose files changed.
+            # Shared-logic files (this workflow, image-build.yml) run all.
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              base="${{ github.event.pull_request.base.sha }}"
+            else
+              base="${{ github.event.before }}"
+              if [[ "$base" =~ ^0+$ ]]; then base="${{ github.event.pull_request.base.sha || 'HEAD^' }}"; fi
+            fi
+            git diff --name-only "${base}" HEAD > /tmp/changed || git diff --name-only HEAD^ HEAD > /tmp/changed
+            variants=$(
+              echo "$all_variants" | while read -r ubi flavor; do
+                dockerfile="Dockerfile.ubi${ubi}"
+                [ "$flavor" = "fips" ] && dockerfile="${dockerfile}-openssl-fips"
+                if grep -qxF "$dockerfile" /tmp/changed \
+                  || grep -qxF '.github/workflows/build.yml' /tmp/changed \
+                  || grep -qxF '.github/workflows/image-build.yml' /tmp/changed; then
+                  echo "$ubi $flavor"
+                fi
+              done | python3 -c '
+          import json, sys
+          include = []
+          for line in sys.stdin:
+              ubi, flavor = line.split()
+              include.append({"ubi": ubi, "flavor": flavor})
+          print(json.dumps({"include": include}))
+          '
+            )
+          fi
+
+          echo "variants: $variants"
+          echo "variants=$variants" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: changes
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.changes.outputs.variants) }}
+    uses: ./.github/workflows/image-build.yml
+    permissions:
+      actions: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    secrets: inherit
+    with:
+      ubi: ${{ matrix.ubi }}
+      flavor: ${{ matrix.flavor }}
+      go_version: ${{ github.event_name == 'workflow_dispatch' && inputs.go_version || '' }}
+      run: >-
+        ${{ github.event_name != 'workflow_dispatch' ||
+             (matrix.ubi == inputs.ubi && matrix.flavor == inputs.flavor) }}

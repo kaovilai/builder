@@ -28,9 +28,15 @@ on:
         required: false
         type: string
         default: ''
+      run:
+        description: 'Whether to run this call (per-leg gating from the caller matrix; a job-level if cannot reference matrix)'
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   determine-versions:
+    if: inputs.run
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
