@@ -1,0 +1,47 @@
+name: 'Submit image SBOMs to the dependency graph'
+
+# Scans the published quay.io/konveyor/builder images with Syft and submits
+# the SBOMs to GitHub's dependency submission API, so the dependency graph
+# reflects the actual image contents (RPMs, Go toolchain) instead of nothing
+# — a Dockerfile-only repo has no manifests for GitHub to detect. Once
+# Dependabot alerts are enabled in repository settings, alerts and
+# notifications cover the image contents.
+#
+# Runs weekly, on demand, and after each publish (dispatched by the build
+# workflows' merge jobs, with cancel-in-progress collapsing the queue so a
+# publish round costs roughly one full scan pass). Uses the builtin
+# GITHUB_TOKEN; the action derives a unique correlator per image so all six
+# images coexist in the graph.
+
+on:
+  schedule:
+    - cron: '0 4 * * 6'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: submit-sboms
+  cancel-in-progress: true
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - quay.io/konveyor/builder:latest
+          - quay.io/konveyor/builder:ubi9-latest
+          - quay.io/konveyor/builder:ubi10-latest
+          - quay.io/konveyor/builder:openssl-fips-latest
+          - quay.io/konveyor/builder:ubi9-openssl-fips-latest
+          - quay.io/konveyor/builder:ubi10-openssl-fips-latest
+    steps:
+      - name: generate and submit SBOM...
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ matrix.image }}
+          format: spdx-json
+          dependency-snapshot: true

@@ -185,3 +185,17 @@ jobs:
           else
             echo "[skip: not on ${DEFAULT_BRANCH} or dry-run] would refresh README version badges"
           fi
+
+      - name: Submit image SBOMs to the dependency graph
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          # SBOM submission keeps GitHub's dependency graph in sync with the
+          # published images; weekly convergence on top of the post-publish
+          # triggers in the build workflows.
+          if [ "$GITHUB_REF" = "refs/heads/${DEFAULT_BRANCH}" ] && [ "${DRY_RUN}" != "true" ]; then
+            echo "Submitting image SBOMs ..."
+            gh workflow run submit-sboms.yml
+          else
+            echo "[skip: not on ${DEFAULT_BRANCH} or dry-run] would submit image SBOMs"
+          fi
