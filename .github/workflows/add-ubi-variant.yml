@@ -5,8 +5,10 @@ name: 'Detect and add new UBI variants'
 # variant for, derive the new variant's Dockerfiles, build workflows,
 # dispatcher entries, and README rows from the newest existing major and
 # open a PR for review. Detection only probes the registry; generation is
-# mechanical templating — the PR's CI builds the new variant on all
-# platforms once approved.
+# mechanical templating. Note the opened PR gets no workflow runs of its
+# own: it is created with the builtin GITHUB_TOKEN, whose events never
+# trigger workflows — CI builds the variant once the branch lands (or a
+# maintainer pushes to it, e.g. an empty commit).
 #
 # Uses only the builtin GITHUB_TOKEN (contents: write for the branch push,
 # pull-requests: write for the PR).
@@ -123,7 +125,7 @@ jobs:
 
           Review notes:
           - The Dockerfiles are mechanical copies with the base image swapped — check for UBI ${target} base-image changes (package set, dnf behavior) that may need adjusting.
-          - CI on this PR builds the new variant on all platforms once the runs are approved.
+          - This PR is opened with the builtin GITHUB_TOKEN, so GitHub triggers no workflow runs on it (recursion guard). To see CI build the new variant, push any commit to the \`add-ubi${target}\` branch (e.g. an empty one) or re-run the checks manually after merging.
           - The godev workflow and image remain ubi9-only (dispatch-built special case).
           BODYEOF
 
