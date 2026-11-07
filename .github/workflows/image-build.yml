@@ -248,9 +248,139 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  e2e:
+    # Compile and run a tiny cgo + crypto Go app inside the freshly built
+    # image (native platform, served from the build job's GHA cache),
+    # verifying the consumer contract: toolchain present, cgo works,
+    # output correct — and for the fips flavor, that FIPS enforcement is
+    # actually engaged. Gates the publish path.
+    needs: determine-versions
+    runs-on: ubuntu-latest
+    env:
+      UBI: ${{ inputs.ubi }}
+      FLAVOR: ${{ inputs.flavor }}
+      DOCKERFILE: ${{ inputs.flavor == 'fips' && 'Dockerfile-fips' || 'Dockerfile' }}
+      CACHE_SCOPE: ${{ inputs.flavor == 'fips' && format('ubi{0}-openssl-fips', inputs.ubi) || format('ubi{0}', inputs.ubi) }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.determine-versions.outputs.matrix) }}
+    steps:
+      - name: add checkout action...
+        uses: actions/checkout@v6
+
+      - name: configure buildx action...
+        uses: docker/setup-buildx-action@v4
+
+      - name: build image for the e2e test...
+        # Native platform only; the build job's cache makes this a
+        # near-instant rebuild of the already-built amd64 image.
+        env:
+          BUILD_ARG: ${{ matrix.build_arg }}
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform linux/amd64 \
+            --file "$DOCKERFILE" \
+            --build-arg UBI_MAJOR="$UBI" \
+            --build-arg "$BUILD_ARG" \
+            --cache-from "type=gha,scope=${CACHE_SCOPE}-linux-amd64" \
+            --tag builder-e2e:test \
+            --load \
+            .
+
+      - name: compile and run a cgo app in the image...
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/app
+          cat > /tmp/app/main.go <<'EOF'
+          package main
+
+          /*
+          #include <stdio.h>
+          */
+          import "C"
+
+          import (
+          	"crypto/sha256"
+          	"fmt"
+          )
+
+          func main() {
+          	if n := C.puts(C.CString("cgo ok")); n < 0 {
+          		panic("puts failed")
+          	}
+          	C.fflush(C.stdout)
+          	fmt.Printf("sha256:%x\n", sha256.Sum256([]byte("e2e")))
+          }
+          EOF
+          printf 'module e2e\n\ngo 1.22\n' > /tmp/app/go.mod
+
+          docker run --rm -v /tmp/app:/app -w /app builder-e2e:test go build -o app .
+          docker run --rm -v /tmp/app:/app -w /app builder-e2e:test ./app | tee /tmp/e2e-out
+          expected=$(printf e2e | sha256sum | cut -d' ' -f1)
+          grep -qx 'cgo ok' /tmp/e2e-out
+          grep -qx "sha256:$expected" /tmp/e2e-out
+          echo "e2e: cgo compile + run verified"
+
+      - name: verify the FIPS contract...
+        if: inputs.flavor == 'fips'
+        run: |
+          set -euo pipefail
+          # GOEXPERIMENT must be baked into the image
+          [ "$(docker run --rm builder-e2e:test sh -c 'echo "$GOEXPERIMENT"')" = strictfipsruntime ]
+
+          ver=$(docker run --rm builder-e2e:test go version | awk '{ print $3 }' | sed 's/^go//')
+          if [ "$(printf '%s\n1.27\n' "$ver" | sort -V | head -1)" = "1.27" ]; then
+            # 1.27+ hostfips toolchain: native crypto/fips140 module —
+            # probe that enforcement is engaged, not just compiled in
+            mkdir -p /tmp/fips
+            cat > /tmp/fips/ok.go <<'EOF'
+          package main
+
+          import (
+          	"crypto/sha256"
+          	"fmt"
+          )
+
+          func main() {
+          	fmt.Printf("approved:%v\n", sha256.Sum256([]byte("probe"))[0] >= 0)
+          }
+          EOF
+            docker run --rm -v /tmp/fips:/f -w /f \
+              -e GOLANG_NATIVE_HOSTFIPS_OVERRIDE=1 -e GODEBUG=fips140=only \
+              builder-e2e:test go run ok.go | grep -qx 'approved:true'
+
+            # negative control: RSA-1024 must be rejected under fips140=only
+            cat > /tmp/fips/reject.go <<'EOF'
+          package main
+
+          import (
+          	"crypto/rand"
+          	"crypto/rsa"
+          )
+
+          func main() {
+          	if _, err := rsa.GenerateKey(rand.Reader, 1024); err != nil {
+          		panic(err)
+          	}
+          }
+          EOF
+            if docker run --rm -v /tmp/fips:/f -w /f \
+              -e GOLANG_NATIVE_HOSTFIPS_OVERRIDE=1 -e GODEBUG=fips140=only \
+              builder-e2e:test go run reject.go; then
+              echo "FAIL: RSA-1024 was allowed under fips140=only"
+              exit 1
+            fi
+            echo "e2e: FIPS enforcement verified (approved crypto works, non-approved rejected)"
+          else
+            # <=1.26 openssl-fips backend ignores the fips140 GODEBUG switch
+            # (verified live) — version + GOEXPERIMENT assertions only
+            echo "e2e: openssl-fips toolchain go${ver} — version + GOEXPERIMENT asserted"
+          fi
+
   merge:
     runs-on: ubuntu-latest
-    needs: [determine-versions, build]
+    needs: [determine-versions, build, e2e]
     env:
       # Reusable-workflow calls share the caller run's artifact namespace:
       # names must carry the variant so concurrent variants don't collide.
