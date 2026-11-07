@@ -147,11 +147,13 @@ jobs:
             echo "approved crypto ok"
 
             # negative control: RSA-1024 must be rejected under fips140=only
-            # (verified live: "use of keys smaller than 2048 bits is not
-            # allowed in FIPS 140-only mode"), and must succeed with
-            # fips140=off — proving the rejection is FIPS-driven rather than
-            # a toolchain limitation.
-            if docker run --rm \
+            # with the specific FIPS key-size error (verified live: "use of
+            # keys smaller than 2048 bits is not allowed in FIPS 140-only
+            # mode"), and must succeed with fips140=off — proving the
+            # rejection is FIPS-driven rather than a toolchain limitation.
+            # Any other failure (docker, compile, runtime) must not count as
+            # proof of enforcement.
+            neg_out=$(docker run --rm \
               -e GOLANG_NATIVE_HOSTFIPS_OVERRIDE=1 \
               -e GODEBUG=fips140=only \
               "${{ matrix.image }}" sh -c 'cat > /tmp/probe.go << "EOF"
@@ -173,10 +175,20 @@ jobs:
           	fmt.Println("rsa-1024 allowed")
           }
           EOF
-          cd /tmp && go run probe.go' >/dev/null 2>&1; then
-              echo "FAIL: non-approved crypto (RSA-1024) was allowed under fips140=only"
-              exit 1
-            fi
+          cd /tmp && go run probe.go' 2>&1) || true
+            case "$neg_out" in
+              *"keys smaller than 2048 bits"*)
+                ;; # expected FIPS-driven rejection
+              *"rsa-1024 allowed"*)
+                echo "FAIL: non-approved crypto (RSA-1024) was allowed under fips140=only"
+                exit 1
+                ;;
+              *)
+                echo "FAIL: negative probe failed for an unexpected reason (expected the FIPS RSA key-size rejection):"
+                echo "$neg_out"
+                exit 1
+                ;;
+            esac
             docker run --rm \
               -e GODEBUG=fips140=off \
               "${{ matrix.image }}" sh -c 'cat > /tmp/probe.go << "EOF"
