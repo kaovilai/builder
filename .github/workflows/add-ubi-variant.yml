@@ -64,7 +64,7 @@ jobs:
               return 0
             fi
             case "$err" in
-              *"name unknown"*|*"not found"*|*"manifest unknown"*) return 1 ;;
+              *"name unknown"*|*"not found"*|*"manifest unknown"*|*"no such manifest"*) return 1 ;;
               *) echo "WARNING: registry check for ubi$1 inconclusive: $err" >&2; return 2 ;;
             esac
           }

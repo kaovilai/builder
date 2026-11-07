@@ -1,9 +1,21 @@
 version: 2
 updates:
   # Keep the pinned GitHub Actions current (checkout, docker/*, attest,
-  # sbom-action, upload/download-artifact).
+  # sbom-action, upload/download-artifact). Updates are grouped per update
+  # type (applies-to accepts only version-updates or security-updates, and
+  # defaults to version updates when omitted), so at most one version-update
+  # PR and one security-update PR are open at a time.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      version-updates:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
