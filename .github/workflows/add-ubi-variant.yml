@@ -1,0 +1,249 @@
+name: 'Detect and add new UBI variants'
+
+# Weekly check for new UBI major versions (e.g. ubi11) on
+# registry.access.redhat.com. When a major is served that this repo has no
+# variant for, derive the new variant's Dockerfiles, build workflows,
+# dispatcher entries, and README rows from the newest existing major and
+# open a PR for review. Detection only probes the registry; generation is
+# mechanical templating — the PR's CI builds the new variant on all
+# platforms once approved.
+#
+# Uses only the builtin GITHUB_TOKEN (contents: write for the branch push,
+# pull-requests: write for the PR).
+
+on:
+  schedule:
+    - cron: '0 3 * * 6'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Log what would be generated without committing or opening a PR'
+        required: false
+        type: boolean
+        default: false
+      force_major:
+        description: 'Generate for this major regardless of registry detection (testing)'
+        required: false
+        default: ''
+  push:
+    paths:
+      - '.github/workflows/add-ubi-variant.yml'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: add-ubi-variant
+  cancel-in-progress: false
+
+jobs:
+  add:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+      FORCE_MAJOR: ${{ github.event_name == 'workflow_dispatch' && inputs.force_major || '' }}
+    steps:
+      - name: add checkout action...
+        uses: actions/checkout@v6
+
+      - name: Detect new UBI major and generate variant
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          # registry probe: 0 = available, 1 = confirmed missing, 2 = inconclusive
+          registry_has() {
+            local err
+            if err=$(docker manifest inspect "registry.access.redhat.com/ubi$1:latest" 2>&1); then
+              return 0
+            fi
+            case "$err" in
+              *"name unknown"*|*"not found"*|*"manifest unknown"*) return 1 ;;
+              *) echo "WARNING: registry check for ubi$1 inconclusive: $err" >&2; return 2 ;;
+            esac
+          }
+
+          known=$(ls Dockerfile.ubi[0-9]* 2>/dev/null | grep -oE 'ubi[0-9]+' | grep -oE '[0-9]+' | sort -n -u)
+          max_known=$(echo "$known" | tail -1)
+          min_known=$(echo "$known" | head -1)
+          echo "Existing UBI majors: $(echo "$known" | tr '\n' ' ')(min=$min_known max=$max_known)"
+
+          # Control: the registry must confirm a known major, else detection is
+          # unreliable (network/auth issue) and no conclusion can be drawn.
+          if ! registry_has "$max_known"; then
+            echo "ERROR: control probe for ubi$max_known failed; aborting without conclusions"
+            exit 1
+          fi
+
+          if [ -n "$FORCE_MAJOR" ]; then
+            target="$FORCE_MAJOR"
+            echo "FORCE_MAJOR set: generating for ubi${target} regardless of detection"
+          else
+            target=""
+            m=$((max_known + 1))
+            if registry_has "$m"; then
+              echo "ubi${m} is available on registry.access.redhat.com"
+              target="$m"
+              # a second consecutive new major is picked up by a later run
+              if registry_has "$((m + 1))"; then
+                echo "NOTE: ubi$((m + 1)) is also available; a later run will propose it"
+              fi
+            fi
+          fi
+
+          if [ -z "$target" ]; then
+            echo "No new UBI major available; nothing to do."
+            exit 0
+          fi
+
+          if [ -e "Dockerfile.ubi${target}" ]; then
+            echo "ubi${target} variant already exists; nothing to do."
+            exit 0
+          fi
+
+          branch="add-ubi${target}"
+          if git ls-remote --exit-code --heads "origin" "$branch" >/dev/null 2>&1; then
+            echo "Branch ${branch} already exists (proposal already open or stale); nothing to do."
+            exit 0
+          fi
+
+          echo "Generating UBI ${target} variant from UBI ${max_known} ..."
+          python3 - "$target" "$max_known" <<'PYEOF'
+          import pathlib
+          import sys
+
+          n, src = sys.argv[1], sys.argv[2]
+
+          def read(p):
+              return pathlib.Path(p).read_text()
+
+          def write(p, t):
+              pathlib.Path(p).write_text(t)
+
+          # 1. Derive new files from the newest existing major.
+          for a, b in [
+              (f"Dockerfile.ubi{src}", f"Dockerfile.ubi{n}"),
+              (f"Dockerfile.ubi{src}-openssl-fips", f"Dockerfile.ubi{n}-openssl-fips"),
+              (f".github/workflows/ubi{src}_multi_arch_image_build.yml",
+               f".github/workflows/ubi{n}_multi_arch_image_build.yml"),
+              (f".github/workflows/ubi{src}_openssl_fips_multi_arch_image_build.yml",
+               f".github/workflows/ubi{n}_openssl_fips_multi_arch_image_build.yml"),
+          ]:
+              write(b, read(a).replace(f"ubi{src}", f"ubi{n}"))
+
+          def insert_after(path, needle, new_line):
+              lines = read(path).splitlines(keepends=True)
+              out, hit = [], 0
+              for l in lines:
+                  out.append(l)
+                  if needle in l:
+                      out.append(new_line)
+                      hit += 1
+              if hit != 1:
+                  sys.exit(f"ERROR: expected exactly one '{needle}' line in {path}, found {hit}")
+              write(path, "".join(out))
+
+          def append_after_needle(path, needle, addition):
+              # insert right after the needle (mid-line), not at line end —
+              # the prefix maps close with ' )' after the last entry
+              lines = read(path).splitlines(keepends=True)
+              hit = 0
+              for i, l in enumerate(lines):
+                  if needle in l:
+                      idx = l.index(needle)
+                      end = idx + len(needle)
+                      lines[i] = l[:end] + addition + l[end:]
+                      hit += 1
+              if hit != 1:
+                  sys.exit(f"ERROR: expected exactly one '{needle}' line in {path}, found {hit}")
+              write(path, "".join(lines))
+
+          # 2. Dispatcher variant maps (scheduled_dispatch.yml).
+          d = ".github/workflows/scheduled_dispatch.yml"
+          append_after_needle(d, f'[ubi{src}]="ubi{src}-"', f' [ubi{n}]="ubi{n}-"')
+          insert_after(d, f'[ubi{src}]="ubi{src}_multi_arch_image_build.yml"',
+                       f'            [ubi{n}]="ubi{n}_multi_arch_image_build.yml"\n')
+          append_after_needle(d, f'[ubi{src}]="ubi{src}-openssl-fips-"', f' [ubi{n}]="ubi{n}-openssl-fips-"')
+          insert_after(d, f'[ubi{src}]="ubi{src}_openssl_fips_multi_arch_image_build.yml"',
+                       f'            [ubi{n}]="ubi{n}_openssl_fips_multi_arch_image_build.yml"\n')
+
+          # The variant loops enumerate majors explicitly — extend both.
+          t = read(d)
+          old, new = f"ubi{src}; do", f"ubi{src} ubi{n}; do"
+          if t.count(old) != 2:
+              sys.exit(f"ERROR: expected exactly two '{old}' loops in {d}, found {t.count(old)}")
+          write(d, t.replace(old, new))
+
+          # 3. README table rows.
+          for needle in [f"| `Dockerfile.ubi{src}`", f"| `Dockerfile.ubi{src}-openssl-fips`"]:
+              lines = read("README.md").splitlines(keepends=True)
+              out, hit = [], 0
+              for l in lines:
+                  out.append(l)
+                  if needle in l:
+                      out.append(l.replace(f"ubi{src}", f"ubi{n}"))
+                      hit += 1
+              if hit != 1:
+                  sys.exit(f"ERROR: expected exactly one '{needle}' row in README.md, found {hit}")
+              write("README.md", "".join(out))
+
+          # 4. readme-badges.yml badge entries.
+          rb = ".github/workflows/readme-badges.yml"
+          for needle in [f'badge "UBI {src}"', f'badge "UBI {src} FIPS"']:
+              lines = read(rb).splitlines(keepends=True)
+              out, hit = [], 0
+              for l in lines:
+                  out.append(l)
+                  if needle in l:
+                      out.append(l.replace(f"UBI {src}", f"UBI {n}").replace(f"ubi{src}", f"ubi{n}"))
+                      hit += 1
+              if hit != 1:
+                  sys.exit(f"ERROR: expected exactly one '{needle}' line in {rb}, found {hit}")
+              write(rb, "".join(out))
+          PYEOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git status --short
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "[dry-run] would commit to ${branch} and open a PR"
+            exit 0
+          fi
+
+          # PRs are only proposed from default-branch runs; other refs (self-test
+          # pushes to feature branches) stop after validating the generation.
+          if [ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "[skip: not on ${DEFAULT_BRANCH}] generation validated, not proposing a PR from this ref"
+            exit 0
+          fi
+
+          git checkout -b "$branch"
+          git commit -s -m "Add UBI ${target} variant
+
+          Generated by the add-ubi-variant workflow: registry.access.redhat.com
+          now serves ubi${target}. Dockerfiles, build workflows, dispatcher
+          entries, README rows, and badge entries derived from UBI ${max_known}."
+
+          cat > /tmp/pr-body.md <<BODYEOF
+          Auto-generated by the add-ubi-variant workflow: \`registry.access.redhat.com\` now serves \`ubi${target}\`, and this repo had no variant for it.
+
+          Derived from the UBI ${max_known} templates (\`ubi${max_known}\` → \`ubi${target}\`):
+          - \`Dockerfile.ubi${target}\`, \`Dockerfile.ubi${target}-openssl-fips\`
+          - \`.github/workflows/ubi${target}_multi_arch_image_build.yml\`, \`.github/workflows/ubi${target}_openssl_fips_multi_arch_image_build.yml\`
+          - \`scheduled_dispatch.yml\` variant maps (dispatch targets + expected tags)
+          - \`README.md\` table rows and \`readme-badges.yml\` badge entries
+
+          Review notes:
+          - The Dockerfiles are mechanical copies with the base image swapped — check for UBI ${target} base-image changes (package set, dnf behavior) that may need adjusting.
+          - CI on this PR builds the new variant on all platforms once the runs are approved.
+          BODYEOF
+
+          git push -u origin "$branch"
+          gh pr create --title "Add UBI ${target} variant (auto-generated from UBI ${max_known})" \
+            --body-file /tmp/pr-body.md
