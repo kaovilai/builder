@@ -1,9 +1,12 @@
 ARG UBI_MAJOR=9
-FROM registry.access.redhat.com/ubi${UBI_MAJOR}:latest as base
-RUN dnf -y install go git make jq unzip && \
+FROM registry.access.redhat.com/ubi${UBI_MAJOR}:latest AS bootstrap
+# Build-time only: the dnf `go` RPM bootstraps the toolchain build. Its
+# RPM payload and dependencies (gcc, openssl-devel, perl, ...) stay out
+# of the published image, which installs its own package set.
+RUN dnf -y install go jq && \
     dnf clean all
 
-FROM base as builder
+FROM bootstrap AS builder
 # GO_VERSION is expected to be in the format of goX.Y.Z ie. go1.20.3
 ARG GO_VERSION=
 # Set to latest if not set
@@ -25,6 +28,13 @@ RUN if [ -z "$GO_VERSION" ] || [ "$GO_VERSION" = "go" ]; then \
     export PATH=$PATH:/opt/app-root/src/go/bin && \
     go env && \
     go version
+
+FROM registry.access.redhat.com/ubi${UBI_MAJOR}:latest AS final
+# Consumers compile inside this image: gcc/gcc-c++ keep cgo working
+# (CGO_ENABLED defaults to 1). perl arrives as a dependency of git.
+RUN dnf -y install git make jq unzip gcc gcc-c++ && \
+    dnf clean all
+COPY --from=builder /opt/app-root/src/go /opt/app-root/src/go
 
 #This just makes it easier to switch to/from go-toolset.
 
