@@ -71,7 +71,8 @@ jobs:
           done | sed 's/-openssl-fips//' | sort -n)
 
           variant_prefix() {
-            case "$1:$2" in
+            # $1 = ubi major, $2 = flavor; patterns are flavor:major
+            case "$2:$1" in
               standard:8) echo "" ;;
               standard:*) echo "ubi$1-" ;;
               fips:8)     echo "openssl-fips-" ;;

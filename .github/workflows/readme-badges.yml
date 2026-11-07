@@ -70,12 +70,24 @@ jobs:
           }
 
           {
-            badge "UBI 8"       '^v[0-9]+\.[0-9]+\.[0-9]+$' blue
-            badge "UBI 9"       '^ubi9-v[0-9]+\.[0-9]+\.[0-9]+$' blue
-            badge "UBI 10"      '^ubi10-v[0-9]+\.[0-9]+\.[0-9]+$' blue
-            badge "UBI 8 FIPS"  '^openssl-fips-v[0-9]+\.[0-9]+\.[0-9]+$' blueviolet
-            badge "UBI 9 FIPS"  '^ubi9-openssl-fips-v[0-9]+\.[0-9]+\.[0-9]+$' blueviolet
-            badge "UBI 10 FIPS" '^ubi10-openssl-fips-v[0-9]+\.[0-9]+\.[0-9]+$' blueviolet
+            # Badge entries are derived from the variant Dockerfiles present
+            # in the repo, so new variants are covered automatically. ubi8
+            # publishes unprefixed tags; ubi9/ubi10 are prefixed.
+            for df in $(ls Dockerfile.ubi[0-9]* | grep -v openssl-fips | sort -V) \
+                       $(ls Dockerfile.ubi[0-9]* | grep openssl-fips | sort -V); do
+              case "$df" in
+                *-openssl-fips)
+                  major="${df#Dockerfile.ubi}"; major="${major%%-*}"
+                  if [ "$major" = "8" ]; then rx='^openssl-fips-v'; else rx="^ubi${major}-openssl-fips-v"; fi
+                  badge "UBI ${major} FIPS" "${rx}[0-9]+\.[0-9]+\.[0-9]+\$" blueviolet
+                  ;;
+                *)
+                  major="${df#Dockerfile.ubi}"
+                  if [ "$major" = "8" ]; then rx='^v'; else rx="^ubi${major}-v"; fi
+                  badge "UBI ${major}" "${rx}[0-9]+\.[0-9]+\.[0-9]+\$" blue
+                  ;;
+              esac
+            done
           } > /tmp/badges.md
 
           # Replace the generated region between the markers. Both markers must

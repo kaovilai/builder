@@ -123,7 +123,7 @@ jobs:
 
           Derived from the UBI ${max_known} Dockerfiles (\`ubi${max_known}\` → \`ubi${target}\`):
           - \`Dockerfile.ubi${target}\`, \`Dockerfile.ubi${target}-openssl-fips\`
-          - \`README.md\` table rows and \`readme-badges.yml\` badge entries
+          - \`README.md\` table rows
 
           Everything else derives the variant automatically: the dispatcher
           and build.yml enumerate variants from the Dockerfiles present in
@@ -195,19 +195,10 @@ jobs:
                   sys.exit(f"ERROR: expected exactly one '{needle}' line in README.md, found {hit}")
               write("README.md", "".join(out))
 
-          # 3. readme-badges.yml badge entries.
-          rb = ".github/workflows/readme-badges.yml"
-          for needle in [f'badge "UBI {src}"', f'badge "UBI {src} FIPS"']:
-              lines = read(rb).splitlines(keepends=True)
-              out, hit = [], 0
-              for l in lines:
-                  out.append(l)
-                  if needle in l:
-                      out.append(l.replace(f"UBI {src}", f"UBI {n}").replace(f"ubi{src}", f"ubi{n}"))
-                      hit += 1
-              if hit != 1:
-                  sys.exit(f"ERROR: expected exactly one '{needle}' line in {rb}, found {hit}")
-              write(rb, "".join(out))
+          # Badge entries (readme-badges.yml), the dispatcher's variant list,
+          # build.yml's change detection, and the SBOM scan set all derive
+          # variants from the Dockerfiles or published tags — nothing else
+          # to register.
           PYEOF
 
           git config user.name "github-actions[bot]"
