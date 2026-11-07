@@ -1,0 +1,12 @@
+# Variant registry: one variant per line, "<UBI major> <flavor>".
+# Everything enumerates variants from this file — build.yml's change
+# detection, the scheduled dispatcher, the drift check, badge generation,
+# and the add-ubi-variant generator. Adding a variant = adding a line
+# (the add-ubi-variant workflow does this automatically for new UBI
+# majors); both Dockerfiles are shared and parametrized by UBI_MAJOR.
+8 standard
+8 fips
+9 standard
+9 fips
+10 standard
+10 fips

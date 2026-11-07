@@ -70,12 +70,18 @@ jobs:
           }
 
           {
-            badge "UBI 8"       '^v[0-9]+\.[0-9]+\.[0-9]+$' blue
-            badge "UBI 9"       '^ubi9-v[0-9]+\.[0-9]+\.[0-9]+$' blue
-            badge "UBI 10"      '^ubi10-v[0-9]+\.[0-9]+\.[0-9]+$' blue
-            badge "UBI 8 FIPS"  '^openssl-fips-v[0-9]+\.[0-9]+\.[0-9]+$' blueviolet
-            badge "UBI 9 FIPS"  '^ubi9-openssl-fips-v[0-9]+\.[0-9]+\.[0-9]+$' blueviolet
-            badge "UBI 10 FIPS" '^ubi10-openssl-fips-v[0-9]+\.[0-9]+\.[0-9]+$' blueviolet
+            # Badge entries are derived from the variant registry
+            # (variants.txt), so new variants are covered automatically.
+            # ubi8 publishes unprefixed tags; ubi9/ubi10 are prefixed.
+            while read -r major flavor; do
+              if [ "$flavor" = "fips" ]; then
+                if [ "$major" = "8" ]; then rx='^openssl-fips-v'; else rx="^ubi${major}-openssl-fips-v"; fi
+                badge "UBI ${major} FIPS" "${rx}[0-9]+\.[0-9]+\.[0-9]+\$" blueviolet
+              else
+                if [ "$major" = "8" ]; then rx='^v'; else rx="^ubi${major}-v"; fi
+                badge "UBI ${major}" "${rx}[0-9]+\.[0-9]+\.[0-9]+\$" blue
+              fi
+            done < <(grep -vE '^[[:space:]]*(#|$)' variants.txt | sort -n)
           } > /tmp/badges.md
 
           # Replace the generated region between the markers. Both markers must

@@ -1,0 +1,53 @@
+ARG UBI_MAJOR=9
+FROM registry.access.redhat.com/ubi${UBI_MAJOR}:latest AS bootstrap
+# Build-time only: the dnf `go` RPM bootstraps the toolchain build, and
+# building golang-fips from source needs git, a C compiler, openssl-devel
+# (the <=1.26 OpenSSL backend) and perl. None of these RPMs leak into the
+# published image — the final stage installs its own set.
+RUN dnf -y install go git make jq unzip \
+        gcc gcc-c++ openssl-devel perl && \
+    dnf clean all
+
+FROM bootstrap AS builder
+# FIPS_TAG: e.g. go1.24.2-1-openssl-fips or go1.27.3-1-hostfips-release
+# (resolved by workflow, passed as build arg)
+ARG FIPS_TAG=
+RUN set -ex && \
+    if [ -z "$FIPS_TAG" ]; then \
+        echo "ERROR: FIPS_TAG build arg is required" && exit 1; \
+    fi && \
+    echo "FIPS_TAG=$FIPS_TAG" && \
+    export GOROOT_BOOTSTRAP=$(go env GOROOT) && \
+    git config --global user.name "builder" && \
+    git config --global user.email "builder@konveyor.io" && \
+    git clone --depth 1 --branch "$FIPS_TAG" \
+        https://github.com/golang-fips/go.git /tmp/golang-fips && \
+    cd /tmp/golang-fips && \
+    ./scripts/full-initialize-repo.sh && \
+    cd /tmp/golang-fips/go/src && \
+    ./make.bash && \
+    export GOPATH=$(go env GOPATH) && \
+    rm -rf $GOPATH && \
+    rm -f /usr/bin/go && \
+    mkdir -p /opt/app-root/src/ && \
+    mv /tmp/golang-fips/go /opt/app-root/src/go && \
+    rm -rf /tmp/golang-fips && \
+    export PATH=/opt/app-root/src/go/bin:$PATH && \
+    go env && go version
+
+FROM registry.access.redhat.com/ubi${UBI_MAJOR}:latest AS final
+# The compile contract for FIPS consumers: gcc/gcc-c++ for cgo builds,
+# and openssl-devel so apps built with the <=1.26 openssl-fips toolchain
+# can link against libcrypto inside this image. The 1.27+ hostfips-release
+# toolchain does not link OpenSSL — drop openssl-devel from this set once
+# the openssl-fips minors age out of the two-minor support window.
+# perl is required by the git RPM.
+RUN dnf -y install git make jq unzip \
+        gcc gcc-c++ openssl-devel perl && \
+    dnf clean all
+COPY --from=builder /opt/app-root/src/go /opt/app-root/src/go
+
+ENV PATH=$PATH:/opt/app-root/src/go/bin
+ENV APP_ROOT /opt/app-root
+ENV GOPATH /opt/app-root/src/go
+ENV GOEXPERIMENT=strictfipsruntime

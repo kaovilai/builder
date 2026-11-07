@@ -1,0 +1,168 @@
+name: 'Multi-arch image build'
+
+# Single trigger workflow for every UBI variant. Variants live in
+# variants.txt (the variant registry); the Dockerfiles are shared and
+# parametrized by UBI_MAJOR, so any Dockerfile change rebuilds every
+# variant. workflow_dispatch (used by scheduled_dispatch.yml) selects one
+# variant via the ubi/flavor inputs. The build machinery lives in
+# image-build.yml.
+#
+# Per-leg gating is computed in the `with:` expression — a job-level `if`
+# cannot reference the matrix context (verified live: invalid workflow
+# file) — and passed to the reusable workflow as its `run` input.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ubi:
+        description: 'UBI major version to build (8, 9, 10, ...)'
+        required: true
+        type: string
+      flavor:
+        description: 'Image flavor: standard or fips'
+        required: true
+        type: string
+      go_version:
+        description: 'Go version to build (X.Y.Z); empty builds latest'
+        required: false
+        type: string
+        default: ''
+  push:
+    paths:
+      - 'Dockerfile*'
+      - 'variants.txt'
+      - '.github/workflows/build.yml'
+      - '.github/workflows/image-build.yml'
+  pull_request:
+    paths:
+      - 'Dockerfile*'
+      - 'variants.txt'
+      - '.github/workflows/build.yml'
+      - '.github/workflows/image-build.yml'
+
+permissions: {}
+
+concurrency:
+  # Dispatches must not share a group: GitHub keeps one running + one
+  # pending per group, so a shared group would collapse the dispatcher's
+  # per-variant batch. Push/PR runs share per-ref as before.
+  group: build-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && format('{0}-{1}', inputs.ubi, inputs.flavor) || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      variants: ${{ steps.set.outputs.variants }}
+      count: ${{ steps.set.outputs.count }}
+    steps:
+      - name: add checkout action...
+        uses: actions/checkout@v6
+        with:
+          # full history so the event's base commit is available for diffing
+          fetch-depth: 0
+
+      - name: Resolve variants to build
+        id: set
+        env:
+          # inputs reach the script only through environment variables —
+          # never interpolated into shell source (template injection)
+          UBI: ${{ inputs.ubi }}
+          FLAVOR: ${{ inputs.flavor }}
+          GO_VERSION_INPUT: ${{ inputs.go_version }}
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          # Variants come from the registry (variants.txt).
+          all_variants=$(grep -vE '^[[:space:]]*(#|$)' variants.txt | sort -n)
+          if grep -qvE '^[0-9]+ (standard|fips)$' <<< "$all_variants"; then
+            echo "ERROR: variants.txt has malformed lines (expected '<major> <standard|fips>'):"
+            grep -vE '^[0-9]+ (standard|fips)$' <<< "$all_variants"
+            exit 1
+          fi
+
+          variants=$(
+            echo "$all_variants" | python3 -c '
+          import json, sys
+          include = []
+          for line in sys.stdin:
+              ubi, flavor = line.split()
+              include.append({"ubi": ubi, "flavor": flavor})
+          print(json.dumps({"include": include}))
+          '
+          )
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Dispatch path selects its variant via the caller matrix gating.
+            # Validate the requested variant + version up front: a dispatch
+            # matching no variant would otherwise skip every matrix leg and
+            # silently do nothing, and a malformed go_version would waste a
+            # full multi-arch build before failing.
+            # exact string comparison, not grep: a value containing a
+            # newline would otherwise be split into multiple patterns
+            found=""
+            while IFS= read -r line; do
+              if [ "$line" = "${UBI} ${FLAVOR}" ]; then found=1; break; fi
+            done <<< "$all_variants"
+            if [ -z "$found" ]; then
+              echo "ERROR: ubi${UBI} (${FLAVOR}) is not in variants.txt; variants are:"
+              echo "$all_variants"
+              exit 1
+            fi
+            if [ -n "$GO_VERSION_INPUT" ] \
+              && ! [[ "$GO_VERSION_INPUT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "ERROR: go_version '$GO_VERSION_INPUT' is not X.Y.Z"
+              exit 1
+            fi
+          else
+            # Push/pull_request: the Dockerfiles are shared, so any change
+            # to them (or the registry, or the build workflows) rebuilds
+            # every variant; there is no per-variant file to diff against.
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              base="${{ github.event.pull_request.base.sha }}"
+            else
+              base="${{ github.event.before }}"
+              if [[ "$base" =~ ^0+$ ]]; then
+                # First push of a new branch (before = zeros): diff the whole
+                # branch, not just its last commit, so variants changed by
+                # earlier commits are still built.
+                base=$(git merge-base HEAD "origin/${{ github.event.repository.default_branch }}")
+              fi
+            fi
+            git diff --name-only "${base}" HEAD > /tmp/changed || git diff --name-only HEAD^ HEAD > /tmp/changed
+            if grep -qxE 'Dockerfile(-openssl-fips)?|variants\.txt|\.github/workflows/(build|image-build)\.yml' /tmp/changed; then
+              : # shared change — keep every variant
+            else
+              variants='{"include": []}'
+            fi
+          fi
+
+          echo "variants: $variants"
+          echo "variants=$variants" >> "$GITHUB_OUTPUT"
+          count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["include"]))' <<< "$variants")
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: changes
+    # A Dockerfile-removal-only change filters every variant out; an empty
+    # include array makes GitHub fail the run instead of skipping the job
+    # (probed live: zero matrix jobs = workflow failure).
+    if: needs.changes.outputs.count != '0'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.changes.outputs.variants) }}
+    uses: ./.github/workflows/image-build.yml
+    permissions:
+      actions: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    secrets: inherit
+    with:
+      ubi: ${{ matrix.ubi }}
+      flavor: ${{ matrix.flavor }}
+      go_version: ${{ github.event_name == 'workflow_dispatch' && inputs.go_version || '' }}
+      run: >-
+        ${{ github.event_name != 'workflow_dispatch' ||
+             (matrix.ubi == inputs.ubi && matrix.flavor == inputs.flavor) }}
