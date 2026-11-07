@@ -1,10 +1,11 @@
 name: 'Multi-arch image build'
 
-# Single trigger workflow for every UBI variant. Push and pull_request runs
-# derive the variant list from the Dockerfiles in the repo and filter it to
-# the variants whose files changed (shared-logic changes run everything);
-# workflow_dispatch (used by scheduled_dispatch.yml) selects one variant via
-# the ubi/flavor inputs. The build machinery lives in image-build.yml.
+# Single trigger workflow for every UBI variant. Variants live in
+# variants.txt (the variant registry); the Dockerfiles are shared and
+# parametrized by UBI_MAJOR, so any Dockerfile change rebuilds every
+# variant. workflow_dispatch (used by scheduled_dispatch.yml) selects one
+# variant via the ubi/flavor inputs. The build machinery lives in
+# image-build.yml.
 #
 # Per-leg gating is computed in the `with:` expression — a job-level `if`
 # cannot reference the matrix context (verified live: invalid workflow
@@ -28,12 +29,14 @@ on:
         default: ''
   push:
     paths:
-      - 'Dockerfile.ubi*'
+      - 'Dockerfile*'
+      - 'variants.txt'
       - '.github/workflows/build.yml'
       - '.github/workflows/image-build.yml'
   pull_request:
     paths:
-      - 'Dockerfile.ubi*'
+      - 'Dockerfile*'
+      - 'variants.txt'
       - '.github/workflows/build.yml'
       - '.github/workflows/image-build.yml'
 
@@ -65,13 +68,13 @@ jobs:
           set -euo pipefail
           shopt -s inherit_errexit
 
-          # Variants are derived from the Dockerfiles present in the repo.
-          all_variants=$(ls Dockerfile.ubi[0-9]* | while read -r df; do
-            case "$df" in
-              *-openssl-fips) echo "${df#Dockerfile.ubi} fips" ;;
-              *)              echo "${df#Dockerfile.ubi} standard" ;;
-            esac
-          done | sed 's/-openssl-fips//' | sort -n)
+          # Variants come from the registry (variants.txt).
+          all_variants=$(grep -vE '^[[:space:]]*(#|$)' variants.txt | sort -n)
+          if grep -qvE '^[0-9]+ (standard|fips)$' <<< "$all_variants"; then
+            echo "ERROR: variants.txt has malformed lines (expected '<major> <standard|fips>'):"
+            grep -vE '^[0-9]+ (standard|fips)$' <<< "$all_variants"
+            exit 1
+          fi
 
           variants=$(
             echo "$all_variants" | python3 -c '
@@ -91,7 +94,7 @@ jobs:
             # silently do nothing, and a malformed go_version would waste a
             # full multi-arch build before failing.
             if ! grep -qxF "${{ inputs.ubi }} ${{ inputs.flavor }}" <<< "$all_variants"; then
-              echo "ERROR: no Dockerfile for ubi${{ inputs.ubi }} (${{ inputs.flavor }}); variants are:"
+              echo "ERROR: ubi${{ inputs.ubi }} (${{ inputs.flavor }}) is not in variants.txt; variants are:"
               echo "$all_variants"
               exit 1
             fi
@@ -101,8 +104,9 @@ jobs:
               exit 1
             fi
           else
-            # Push/pull_request: keep only variants whose files changed.
-            # Shared-logic files (this workflow, image-build.yml) run all.
+            # Push/pull_request: the Dockerfiles are shared, so any change
+            # to them (or the registry, or the build workflows) rebuilds
+            # every variant; there is no per-variant file to diff against.
             if [ "${{ github.event_name }}" = "pull_request" ]; then
               base="${{ github.event.pull_request.base.sha }}"
             else
@@ -115,24 +119,11 @@ jobs:
               fi
             fi
             git diff --name-only "${base}" HEAD > /tmp/changed || git diff --name-only HEAD^ HEAD > /tmp/changed
-            variants=$(
-              echo "$all_variants" | while read -r ubi flavor; do
-                dockerfile="Dockerfile.ubi${ubi}"
-                [ "$flavor" = "fips" ] && dockerfile="${dockerfile}-openssl-fips"
-                if grep -qxF "$dockerfile" /tmp/changed \
-                  || grep -qxF '.github/workflows/build.yml' /tmp/changed \
-                  || grep -qxF '.github/workflows/image-build.yml' /tmp/changed; then
-                  echo "$ubi $flavor"
-                fi
-              done | python3 -c '
-          import json, sys
-          include = []
-          for line in sys.stdin:
-              ubi, flavor = line.split()
-              include.append({"ubi": ubi, "flavor": flavor})
-          print(json.dumps({"include": include}))
-          '
-            )
+            if grep -qxE 'Dockerfile(-openssl-fips)?|variants\.txt|\.github/workflows/(build|image-build)\.yml' /tmp/changed; then
+              : # shared change — keep every variant
+            else
+              variants='{"include": []}'
+            fi
           fi
 
           echo "variants: $variants"

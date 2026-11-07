@@ -1,4 +1,5 @@
-FROM registry.access.redhat.com/ubi10:latest as base
+ARG UBI_MAJOR=9
+FROM registry.access.redhat.com/ubi${UBI_MAJOR}:latest as base
 RUN dnf -y install go git make jq unzip && \
     dnf clean all
 

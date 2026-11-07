@@ -1,4 +1,5 @@
-FROM registry.access.redhat.com/ubi9:latest as base
+ARG UBI_MAJOR=9
+FROM registry.access.redhat.com/ubi${UBI_MAJOR}:latest as base
 # gcc + openssl-devel mandatory — CGO required for FIPS/OpenSSL linking
 RUN dnf -y install go git make jq unzip \
         gcc gcc-c++ openssl-devel perl && \

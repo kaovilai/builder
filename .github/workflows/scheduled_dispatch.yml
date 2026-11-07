@@ -66,12 +66,7 @@ jobs:
           # new variant needs no dispatcher registration. Each dispatches the
           # shared build.yml workflow with its ubi/flavor; expected tag prefixes
           # follow the published scheme (ubi8 unprefixed, ubi9/ubi10 prefixed).
-          variants=$(ls Dockerfile.ubi[0-9]* 2>/dev/null | while read -r df; do
-            case "$df" in
-              *-openssl-fips) echo "${df#Dockerfile.ubi} fips" ;;
-              *)              echo "${df#Dockerfile.ubi} standard" ;;
-            esac
-          done | sed 's/-openssl-fips//' | sort -n)
+          variants=$(grep -vE '^[[:space:]]*(#|$)' variants.txt | sort -n)
 
           variant_prefix() {
             # $1 = ubi major, $2 = flavor; patterns are flavor:major
