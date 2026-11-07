@@ -49,6 +49,16 @@ jobs:
       - name: add checkout action...
         uses: actions/checkout@v6
 
+      # quay push credentials for re-pointing canonical latest aliases after
+      # confirmed rebuilds (explicit-version builds only publish the
+      # versioned and latest<version> aliases)
+      - name: add quay login...
+        uses: docker/login-action@v4
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_PUBLISH_ROBOT }}
+          password: ${{ secrets.QUAY_PUBLISH_TOKEN }}
+
       - name: Check base image digests and rebuild drifted variants
         run: |
           set -euo pipefail
@@ -73,11 +83,14 @@ jobs:
           echo "current base digests: $current"
 
           # State maps each major to {applied: <digest>, pending: {digest,
-          # dispatched_at, targets: [<tag>, ...]}}. `applied` advances only
-          # after every dispatched target tag's rebuild is confirmed
-          # republished — a failed rebuild leaves the major pending and its
-          # unpublished targets re-dispatched on the next run, instead of
-          # silently stranding them on a stale base forever.
+          # dispatched_at, targets: [<tag>, ...], latest: [{alias, was,
+          # of}, ...]}}. `applied` advances only after every dispatched
+          # target tag's rebuild is confirmed republished — a failed rebuild
+          # leaves the major pending and its unpublished targets
+          # re-dispatched on the next run, instead of silently stranding
+          # them on a stale base forever. `latest` records the canonical
+          # latest aliases backing a dispatched target so confirmation can
+          # re-point them at the rebuilt digest.
           state=$(cat "$state_file")
           pending_majors=$(jq -r '[to_entries[] | select(.value.pending) | .key] | join(" ")' <<< "$state")
 
@@ -116,6 +129,35 @@ jobs:
               done
               if [ -z "$missing" ]; then
                 echo "[ubi${major}] dispatched rebuilds published; recording ${pd}"
+                # Re-point canonical latest aliases that backed one of the
+                # rebuilt targets: explicit-version builds publish only the
+                # versioned and latest<version> aliases, so <prefix>latest
+                # would otherwise keep serving the stale base. Only aliases
+                # still on their dispatch-time digest are moved (never
+                # demoting a latest that a newer build has since promoted),
+                # and only onto the new digest of the target that backed
+                # them (never promoting an older minor to latest). Runs
+                # before the state advance so a failed re-point leaves the
+                # major pending and retried next week.
+                while read -r alias was of; do
+                  [ -n "$alias" ] || continue
+                  lat_now=$(awk -v t="$alias" '$1 == t {print $2; exit}' /tmp/tags.txt)
+                  new_d=$(awk -v t="$of" '$1 == t {print $2; exit}' /tmp/tags.txt)
+                  if [ -z "$lat_now" ] || [ "$lat_now" != "$was" ]; then
+                    echo "[ubi${major}] ${alias} moved since dispatch; leaving it"
+                  elif [ -z "$new_d" ] || [ "$new_d" = "$was" ]; then
+                    echo "[ubi${major}] ${alias}: ${of} not republished with a new digest; leaving it"
+                  elif [ "${DRY_RUN}" = "true" ]; then
+                    echo "[dry-run] would re-point ${alias} -> ${new_d} (${of})"
+                  elif [ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+                    echo "[skip: not on ${DEFAULT_BRANCH}] would re-point ${alias} -> ${new_d} (${of})"
+                  else
+                    docker buildx imagetools create \
+                      -t "quay.io/konveyor/builder:${alias}" \
+                      "quay.io/konveyor/builder@${new_d}"
+                    echo "[ubi${major}] re-pointed ${alias} -> ${new_d} (${of})"
+                  fi
+                done < <(jq -r --arg m "$major" '.[$m].pending.latest // [] | .[] | "\(.alias) \(.was) \(.of)"' <<< "$state")
                 state=$(jq -c --arg m "$major" --arg d "$pd" \
                   '.[$m].applied = $d | .[$m] |= del(.pending)' <<< "$state")
               else
@@ -234,9 +276,32 @@ jobs:
             dispatched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
             while read -r major; do
               targets_json=$(awk -v m="$major" '$1 == m {print $3}' /tmp/dispatched.txt | sort -u | jq -R . | jq -sc .)
+              # canonical latest aliases backing one of the dispatched
+              # targets, so confirmation can re-point them at the rebuilt
+              # digest (explicit-version builds publish only the versioned
+              # and latest<version> aliases)
+              latest_json="[]"
+              while read -r flavor; do
+                case "${major}:${flavor}" in
+                  8:standard) prefix="" ;;
+                  8:fips)     prefix="openssl-fips-" ;;
+                  *:standard) prefix="ubi${major}-" ;;
+                  *)          prefix="ubi${major}-openssl-fips-" ;;
+                esac
+                alias="${prefix}latest"
+                lat_d=$(awk -v t="$alias" '$1 == t {print $2; exit}' /tmp/tags.txt)
+                [ -n "$lat_d" ] || continue
+                while read -r t; do
+                  if [ "$(awk -v x="$t" '$1 == x {print $2; exit}' /tmp/tags.txt)" = "$lat_d" ]; then
+                    latest_json=$(jq -c --arg a "$alias" --arg w "$lat_d" --arg o "$t" \
+                      '. + [{alias: $a, was: $w, of: $o}]' <<< "$latest_json")
+                    break
+                  fi
+                done < <(awk -v m="$major" -v f="$flavor" '$1 == m && $2 == f {print $3}' /tmp/dispatched.txt)
+              done < <(awk -v m="$major" '$1 == m {print $2}' /tmp/dispatched.txt | sort -u)
               now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
-              state=$(jq -c --arg m "$major" --arg d "$now" --arg t "$dispatched_at" --argjson tg "$targets_json" \
-                '.[$m] = ((.[$m] // {}) + {pending: {digest: $d, dispatched_at: $t, targets: $tg}})' <<< "$state")
+              state=$(jq -c --arg m "$major" --arg d "$now" --arg t "$dispatched_at" --argjson tg "$targets_json" --argjson lt "$latest_json" \
+                '.[$m] = ((.[$m] // {}) + {pending: {digest: $d, dispatched_at: $t, targets: $tg, latest: $lt}})' <<< "$state")
             done < <(awk '{print $1}' /tmp/dispatched.txt | sort -u)
           else
             echo "No base image drift; nothing to rebuild."
