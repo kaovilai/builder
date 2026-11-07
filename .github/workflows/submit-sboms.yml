@@ -1,0 +1,140 @@
+name: 'Submit image SBOMs to the dependency graph'
+
+# Scans the published quay.io/konveyor/builder images with Syft and submits
+# the SBOMs to GitHub's dependency submission API, so the dependency graph
+# reflects the actual image contents (RPMs, Go toolchain) instead of nothing
+# — a Dockerfile-only repo has no manifests for GitHub to detect. Once
+# Dependabot alerts are enabled in repository settings, alerts and
+# notifications cover the image contents.
+#
+# The image set is derived from the tags currently published on
+# quay.io/konveyor/builder: one SBOM per unique manifest, scoped to what the
+# repo ships — per variant family, the newest patch release of each of the
+# two newest minor versions (mirroring the build policy). The many tags
+# pointing at those manifests (bare latest, minor, patch, version-suffixed
+# latest) are covered by their manifest's SBOM; EOL history is not scanned.
+# New variants (e.g. from add-ubi-variant.yml) are picked up automatically
+# after their first publish.
+#
+# sbom-action's default dependency-snapshot correlator is workflow_job,
+# which is identical across matrix legs — GitHub would keep only the latest
+# snapshot per correlator, i.e. one image. Each leg therefore passes an
+# explicit correlator derived from its image and pinned to its version slot
+# (major.minor), so patch updates replace the slot's snapshot rather than
+# accumulating a new stream per patch.
+#
+# Runs weekly, on demand, and after each publish (dispatched by the build
+# workflows' merge jobs, with cancel-in-progress collapsing the queue so a
+# publish round costs roughly one full scan pass). Uses the builtin
+# GITHUB_TOKEN; only the sbom job needs repository write access.
+
+on:
+  schedule:
+    - cron: '0 4 * * 6'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: submit-sboms
+  cancel-in-progress: true
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - name: Resolve published images to scan
+        id: set
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          # Collect all active tags (name + manifest digest) published to
+          # quay.io/konveyor/builder.
+          published_tags() {
+            local page=1 resp
+            while :; do
+              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
+                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
+              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest)"' | grep -v godev
+              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
+              page=$((page + 1))
+            done
+          }
+          published_tags > /tmp/tags.txt
+
+          # Per variant family, select the newest patch of each of the two
+          # newest minor versions present. Tags are grouped by manifest
+          # digest first, so many tags over one image yield one SBOM.
+          matrix=$(python3 - <<'PYEOF'
+          import json
+          import re
+          from collections import defaultdict
+
+          by_digest = {}
+          for line in open("/tmp/tags.txt"):
+              name, digest = line.split()
+              by_digest.setdefault(digest, []).append(name)
+
+          def family(n):
+              fips = "-fips" if "openssl-fips" in n else ""
+              m = re.match(r"^ubi(\d+)", n)
+              return f"ubi{m.group(1) if m else '8'}{fips}"
+
+          fams = defaultdict(list)
+          for digest, names in by_digest.items():
+              versions = set()
+              for n in names:
+                  for m in re.finditer(r"v(\d+)\.(\d+)\.(\d+)", n):
+                      versions.add((int(m[1]), int(m[2]), int(m[3])))
+              fams[family(names[0])].append({"digest": digest, "tags": names, "versions": versions})
+
+          selected = {}
+          for entries in fams.values():
+              minors = sorted({v[:2] for e in entries for v in e["versions"]}, reverse=True)[:2]
+              for minor in minors:
+                  best = None
+                  for e in entries:
+                      for v in e["versions"]:
+                          if v[:2] == minor and (best is None or v > best[0]):
+                              best = (v, e)
+                  if best:
+                      selected[best[1]["digest"]] = best
+
+          include = []
+          for digest, (v, e) in selected.items():
+              suffix = "v%d.%d.%d" % v
+              tag = next(n for n in e["tags"] if n.endswith(suffix))
+              # correlator is stable per variant slot (major.minor): a new
+              # patch of the same minor replaces the slot's previous snapshot
+              # instead of opening a new stream that accumulates forever
+              slot_tag = tag.rsplit(".", 1)[0]
+              include.append({
+                  "image": f"quay.io/konveyor/builder:{tag}",
+                  "correlator": re.sub(r"[^a-zA-Z0-9]+", "-", f"konveyor-builder-{slot_tag}"),
+              })
+          print(json.dumps({"include": sorted(include, key=lambda x: x["image"])}))
+          PYEOF
+          )
+          echo "matrix: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  sbom:
+    needs: images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.images.outputs.matrix) }}
+    steps:
+      - name: generate and submit SBOM...
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ matrix.image }}
+          format: spdx-json
+          dependency-snapshot: true
+          dependency-snapshot-correlator: ${{ matrix.correlator }}
