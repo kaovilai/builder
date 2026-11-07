@@ -7,10 +7,14 @@ name: 'Submit image SBOMs to the dependency graph'
 # Dependabot alerts are enabled in repository settings, alerts and
 # notifications cover the image contents.
 #
+# The image matrix is derived from the *-latest tags currently published on
+# quay.io/konveyor/builder, so new variants (e.g. from add-ubi-variant.yml)
+# are picked up automatically after their first publish.
+#
 # Runs weekly, on demand, and after each publish (dispatched by the build
 # workflows' merge jobs, with cancel-in-progress collapsing the queue so a
 # publish round costs roughly one full scan pass). Uses the builtin
-# GITHUB_TOKEN; the action derives a unique correlator per image so all six
+# GITHUB_TOKEN; the action derives a unique correlator per image so all
 # images coexist in the graph.
 
 on:
@@ -26,18 +30,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  images:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.set.outputs.image }}
+    steps:
+      - name: Resolve published latest tags
+        id: set
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          # Collect all active tags published to quay.io/konveyor/builder.
+          published_tags() {
+            local page=1 resp
+            while :; do
+              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
+                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
+              echo "$resp" | jq -r '.tags[].name'
+              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
+              page=$((page + 1))
+            done
+          }
+
+          # Exactly the bare per-variant latest tags — version-suffixed ones
+          # like ubi10-latest1.26.10 and the v* version tags are excluded.
+          images=$(published_tags \
+            | grep -E '^(ubi[0-9]+-)?(openssl-fips-)?latest$' | sort -u \
+            | sed 's|^|quay.io/konveyor/builder:|' | jq -Rsc 'split("\n") | map(select(length > 0))')
+          echo "images: $images"
+          echo "image=$images" >> "$GITHUB_OUTPUT"
+
   sbom:
+    needs: images
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        image:
-          - quay.io/konveyor/builder:latest
-          - quay.io/konveyor/builder:ubi9-latest
-          - quay.io/konveyor/builder:ubi10-latest
-          - quay.io/konveyor/builder:openssl-fips-latest
-          - quay.io/konveyor/builder:ubi9-openssl-fips-latest
-          - quay.io/konveyor/builder:ubi10-openssl-fips-latest
+        image: ${{ fromJson(needs.images.outputs.image) }}
     steps:
       - name: generate and submit SBOM...
         uses: anchore/sbom-action@v0
