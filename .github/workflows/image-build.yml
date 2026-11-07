@@ -172,11 +172,10 @@ jobs:
     needs: determine-versions
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     env:
-      # Fork PRs have no access to the Quay secrets, and dependabot PRs run
-      # in the same repo but with secrets withheld entirely: build without
-      # pushing in both cases. (PR user.login is dependabot[bot]; both it
-      # and the app identity are excluded.)
-      CAN_PUSH: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.event.pull_request.user.login != 'app/dependabot') }}
+      # Fork PRs have no access to the Quay secrets, and dependabot runs —
+      # both its PRs and its branch pushes — have secrets withheld entirely
+      # (actor guard): build without pushing in all those cases.
+      CAN_PUSH: ${{ github.actor != 'dependabot[bot]' && github.actor != 'app/dependabot' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.event.pull_request.user.login != 'app/dependabot')) }}
       UBI: ${{ inputs.ubi }}
       FLAVOR: ${{ inputs.flavor }}
       DOCKERFILE: ${{ inputs.flavor == 'fips' && 'Dockerfile-fips' || 'Dockerfile' }}
@@ -389,10 +388,10 @@ jobs:
       # Reusable-workflow calls share the caller run's artifact namespace:
       # names must carry the variant so concurrent variants don't collide.
       CACHE_SCOPE: ${{ inputs.flavor == 'fips' && format('ubi{0}-openssl-fips', inputs.ubi) || format('ubi{0}', inputs.ubi) }}
-    # Skip the publish-path merge on fork PRs and dependabot PRs (nothing
-    # was pushed — the merge's quay verification would fail on the
-    # locally built digests).
-    if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.event.pull_request.user.login != 'app/dependabot')
+    # Skip the publish-path merge on fork PRs and dependabot runs — PRs
+    # and branch pushes alike (nothing was pushed; the merge's quay
+    # verification would fail on the locally built digests).
+    if: github.actor != 'dependabot[bot]' && github.actor != 'app/dependabot' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.event.pull_request.user.login != 'app/dependabot'))
     permissions:
       actions: write
       id-token: write
