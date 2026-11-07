@@ -78,6 +78,14 @@ jobs:
             badge "UBI 10 FIPS" '^ubi10-openssl-fips-v[0-9]+\.[0-9]+\.[0-9]+$' blueviolet
           } > /tmp/badges.md
 
+          # Replace the generated region between the markers. Both markers must
+          # exist: a missing end marker would make awk drop everything after
+          # the start marker, silently truncating README.md.
+          for marker in 'readme-badges:start' 'readme-badges:end'; do
+            grep -q "<!-- ${marker}" README.md \
+              || { echo "ERROR: README.md is missing the <!-- ${marker} ... --> marker; refusing to rewrite"; exit 1; }
+          done
+
           # Replace the generated region between the markers.
           awk -v block="$(cat /tmp/badges.md)" '
             /<!-- readme-badges:start/ {print; print block; skip=1; next}

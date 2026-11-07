@@ -82,6 +82,10 @@ jobs:
           fi
 
           if [ -n "$FORCE_MAJOR" ]; then
+            if ! [[ "$FORCE_MAJOR" =~ ^[1-9][0-9]*$ ]]; then
+              echo "ERROR: force_major must be a positive integer (got '${FORCE_MAJOR}')"
+              exit 1
+            fi
             target="$FORCE_MAJOR"
             echo "FORCE_MAJOR set: generating for ubi${target} regardless of detection"
           else
