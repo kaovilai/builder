@@ -73,11 +73,11 @@ jobs:
           echo "current base digests: $current"
 
           # State maps each major to {applied: <digest>, pending: {digest,
-          # dispatched_at, flavors: [...]}}. `applied` advances only after
-          # every dispatched flavor's rebuild is confirmed published — a
-          # failed rebuild leaves the major pending and its unpublished
-          # flavors re-dispatched on the next run, instead of silently
-          # stranding them on a stale base forever.
+          # dispatched_at, targets: [<tag>, ...]}}. `applied` advances only
+          # after every dispatched target tag's rebuild is confirmed
+          # republished — a failed rebuild leaves the major pending and its
+          # unpublished targets re-dispatched on the next run, instead of
+          # silently stranding them on a stale base forever.
           state=$(cat "$state_file")
           pending_majors=$(jq -r '[to_entries[] | select(.value.pending) | .key] | join(" ")' <<< "$state")
 
@@ -92,55 +92,24 @@ jobs:
               page=$((page + 1))
             done
           }
-          # Newest publish time (unix seconds) per variant family
-          # (ubi<major>[-fips]). Unprefixed tags default to UBI 8, matching
-          # the tag scheme in image-build.yml (standard:8 -> "", fips:8 ->
-          # "openssl-fips-") and the target selector's family() below.
-          published_times() {
-            python3 - /tmp/tags.txt <<'PYEOF'
-          import re
-          import sys
-          from email.utils import parsedate_to_datetime
-
-          def family(n):
-              fips = "-fips" if "openssl-fips" in n else ""
-              m = re.match(r"^ubi(\d+)", n)
-              return f"ubi{m.group(1) if m else '8'}{fips}"
-
-          newest = {}
-          for line in open(sys.argv[1]):
-              # last_modified is RFC 1123 ("Thu, 05 Nov 2026 18:51:50 -0000"):
-              # split with maxsplit so its embedded spaces survive
-              parts = line.split(None, 2)
-              if len(parts) < 3:
-                  continue
-              name, when = parts[0], parsedate_to_datetime(parts[2].strip()).timestamp()
-              fam = family(name)
-              newest[fam] = max(newest.get(fam, 0), when)
-          for fam, when in sorted(newest.items()):
-              print(fam, int(when))
-          PYEOF
-          }
-
-          retry_fams=""
+          retry_targets=/tmp/retry-targets.txt
+          : > "$retry_targets"
           if [ -n "$pending_majors" ]; then
-            # Confirm or retry previously dispatched rebuilds — per flavor:
-            # a major advances only once every dispatched flavor has
-            # published, so a failed FIPS rebuild is never masked by a
-            # successful standard publish.
+            # Confirm or retry previously dispatched rebuilds — per target
+            # tag: a major advances only once every dispatched tag has been
+            # republished after the dispatch, so a failed rebuild of one
+            # flavor or version is never masked by other successful
+            # publishes. Unpublished tags are retried individually below.
             published_tags > /tmp/tags.txt
-            published_times > /tmp/published.tsv
             for major in $pending_majors; do
               pd=$(jq -r --arg m "$major" '.[$m].pending.digest // empty' <<< "$state")
               pat=$(jq -r --arg m "$major" '.[$m].pending.dispatched_at // empty' <<< "$state")
-              flavors=$(jq -r --arg m "$major" '.[$m].pending.flavors // ["standard","fips"] | join(" ")' <<< "$state")
+              targets=$(jq -r --arg m "$major" '.[$m].pending.targets // [] | join(" ")' <<< "$state")
               missing=""
-              for flavor in $flavors; do
-                fam="ubi${major}"
-                [ "$flavor" = "fips" ] && fam="${fam}-fips"
-                pub=$(awk -v f="$fam" '$1 == f {print $2}' /tmp/published.tsv)
-                if [ -z "$pub" ] || [ "$(date -d "$pat" +%s)" -ge "$pub" ]; then
-                  missing="$missing $fam"
+              for tag in $targets; do
+                lm=$(awk -v t="$tag" '$1 == t { $1 = ""; $2 = ""; sub(/^ +/, ""); print; exit }' /tmp/tags.txt)
+                if [ -z "$lm" ] || [ "$(date -d "$pat" +%s)" -ge "$(date -d "$lm" +%s)" ]; then
+                  missing="$missing $tag"
                 fi
               done
               if [ -z "$missing" ]; then
@@ -149,7 +118,14 @@ jobs:
                   '.[$m].applied = $d | .[$m] |= del(.pending)' <<< "$state")
               else
                 echo "[ubi${major}] rebuilds not published:${missing}; re-dispatching"
-                retry_fams="$retry_fams${missing}"
+                for tag in $missing; do
+                  case "$tag" in
+                    *openssl-fips*) flavor="fips" ;;
+                    *) flavor="standard" ;;
+                  esac
+                  version=$(sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+)$/\1/' <<< "$tag")
+                  printf '%s %s %s %s\n' "$major" "$flavor" "$version" "$tag" >> "$retry_targets"
+                done
               fi
             done
           fi
@@ -157,7 +133,12 @@ jobs:
           drifted=""
           for major in $majors; do
             now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
-            prev=$(jq -r --arg m "$major" '.[$m].applied // empty' <<< "$state")
+            # Compare against the pending digest while a rebuild round is in
+            # flight: `applied` still holds the pre-drift digest then, and
+            # using it would re-dispatch already-published flavors every
+            # week until the whole round lands. A genuinely new base digest
+            # observed mid-pending still drifts (and re-dispatches) here.
+            prev=$(jq -r --arg m "$major" '.[$m].pending.digest // .[$m].applied // empty' <<< "$state")
             if [ -z "$prev" ]; then
               echo "[ubi${major}] no recorded digest (bootstrap); recording ${now}"
             elif [ "$prev" != "$now" ]; then
@@ -172,21 +153,23 @@ jobs:
           # target set is all majors — not just the drifted ones
           [ "${FORCE}" = "true" ] && drifted="$majors"
 
-          if [ -n "${drifted}${retry_fams}" ]; then
+          if [ -n "${drifted}" ] || [ -s "$retry_targets" ]; then
             # Every currently-shipped version of the affected variants:
             # published tags grouped by manifest digest, per variant family
             # the newest patch of each of the two newest minor versions.
+            # Unpublished retry targets from the confirmation above are
+            # prepended verbatim (retry only what failed, not the whole
+            # family) and deduped against fresh drift dispatches.
             [ -f /tmp/tags.txt ] || published_tags > /tmp/tags.txt
-            targets=$(python3 - "${drifted}" "${retry_fams}" /tmp/tags.txt <<'PYEOF'
+            selector_out=$(python3 - "${drifted}" /tmp/tags.txt <<'PYEOF'
           import re
           import sys
           from collections import defaultdict
 
           drifted = set(sys.argv[1].split())
-          retry = set(sys.argv[2].split())
 
           by_digest = {}
-          for line in open(sys.argv[3]):
+          for line in open(sys.argv[2]):
               parts = line.split()
               name, digest = parts[0], parts[1]
               by_digest.setdefault(digest, []).append(name)
@@ -206,7 +189,7 @@ jobs:
 
           for key, entries in fams.items():
               major = key[len("ubi"):].split("-")[0]
-              if key not in retry and major not in drifted:
+              if major not in drifted:
                   continue
               minors = sorted({v[:2] for e in entries for v in e["versions"]}, reverse=True)[:2]
               for minor in minors:
@@ -218,18 +201,20 @@ jobs:
                   if best:
                       v, e = best
                       flavor = "fips" if key.endswith("-fips") else "standard"
-                      # newest minor dispatches with empty go_version (build
-                      # latest), matching the dispatcher's convention
-                      newest = minor == minors[0]
+                      # Rebuild the exact published version: an empty
+                      # go_version would build the latest upstream release,
+                      # skipping the selected shipped version whenever
+                      # upstream has moved past it. New upstream versions
+                      # are the scheduled dispatcher's job, not this check's.
                       suffix = "v%d.%d.%d" % v
                       tag = next(n for n in e["tags"] if n.endswith(suffix))
-                      print("%s %s %s %s" % (major, flavor, "LATEST" if newest else "%d.%d.%d" % v, tag))
+                      print("%s %s %d.%d.%d %s" % (major, flavor, v[0], v[1], v[2], tag))
           PYEOF
             )
+            targets=$( { cat "$retry_targets"; echo "$selector_out"; } | sed '/^$/d' | sort -u)
             : > /tmp/dispatched.txt
-            while read -r major flavor version _; do
+            while read -r major flavor version tag; do
               [ -n "$major" ] || continue
-              [ "$version" = "LATEST" ] && version=""
               if [ "${DRY_RUN}" = "true" ]; then
                 echo "  [dry-run] would dispatch build.yml (ubi=${major} flavor=${flavor} go_version='${version}')"
               elif [ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
@@ -237,19 +222,19 @@ jobs:
               else
                 echo "  dispatching build.yml (ubi=${major} flavor=${flavor} go_version='${version}')"
                 gh workflow run build.yml -f ubi="${major}" -f flavor="${flavor}" -f go_version="${version}"
-                printf '%s %s\n' "$major" "$flavor" >> /tmp/dispatched.txt
+                printf '%s %s %s\n' "$major" "$flavor" "$tag" >> /tmp/dispatched.txt
               fi
             done <<< "$targets"
 
             # Mark dispatched majors pending publish confirmation, recording
-            # which flavors were dispatched — cleared by the per-flavor check
-            # above only once every one of them has landed on quay.
+            # the exact target tags — cleared by the per-tag check above only
+            # once every one of them has been republished on quay.
             dispatched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
             while read -r major; do
-              flavors=$(awk -v m="$major" '$1 == m {print $2}' /tmp/dispatched.txt | sort -u | jq -R . | jq -sc .)
+              targets_json=$(awk -v m="$major" '$1 == m {print $3}' /tmp/dispatched.txt | sort -u | jq -R . | jq -sc .)
               now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
-              state=$(jq -c --arg m "$major" --arg d "$now" --arg t "$dispatched_at" --argjson f "$flavors" \
-                '.[$m] = ((.[$m] // {}) + {pending: {digest: $d, dispatched_at: $t, flavors: $f}})' <<< "$state")
+              state=$(jq -c --arg m "$major" --arg d "$now" --arg t "$dispatched_at" --argjson tg "$targets_json" \
+                '.[$m] = ((.[$m] // {}) + {pending: {digest: $d, dispatched_at: $t, targets: $tg}})' <<< "$state")
             done < <(awk '{print $1}' /tmp/dispatched.txt | sort -u)
           else
             echo "No base image drift; nothing to rebuild."
