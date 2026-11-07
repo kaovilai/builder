@@ -180,17 +180,23 @@ jobs:
             -t quay.io/konveyor/builder:ubi10-latest${{ matrix.go_version }} \
             $(printf 'quay.io/konveyor/builder@sha256:%s ' $(ls /tmp/digests))
 
+      - name: get multi-arch manifest digest...
+        if: github.event_name != 'pull_request'
+        run: |
+          digest=$(docker buildx imagetools inspect quay.io/konveyor/builder:ubi10-latest${{ matrix.go_version }} --format '{{.Manifest.Digest}}')
+          echo "MANIFEST_DIGEST=$digest" >> $GITHUB_ENV
+
       - name: get go version
         if: github.event_name != 'pull_request'
         id: go_version_patch
         run: |
-          echo "patch_version=$(docker run --rm quay.io/konveyor/builder:ubi10-latest${{ matrix.go_version }} go version | awk '{ print $3 }' | sed -e 's/^go//')" >> $GITHUB_ENV
+          echo "patch_version=$(docker run --rm quay.io/konveyor/builder@${MANIFEST_DIGEST} go version | awk '{ print $3 }' | sed -e 's/^go//')" >> $GITHUB_ENV
 
       - name: get go version
         if: github.event_name != 'pull_request'
         id: go_version_minor
         run: |
-          echo "minor_version=$(docker run --rm quay.io/konveyor/builder:ubi10-latest${{ matrix.go_version }} go version | awk '{ print $3 }' | sed -e 's/^go//' | awk -F '.' '{ print $1 "." $2}')" >> $GITHUB_ENV
+          echo "minor_version=$(docker run --rm quay.io/konveyor/builder@${MANIFEST_DIGEST} go version | awk '{ print $3 }' | sed -e 's/^go//' | awk -F '.' '{ print $1 "." $2}')" >> $GITHUB_ENV
 
       - name: create and push versioned multi-arch manifest...
         if: github.event_name != 'pull_request'
@@ -199,10 +205,6 @@ jobs:
             -t quay.io/konveyor/builder:ubi10-v${{ env.minor_version }} \
             -t quay.io/konveyor/builder:ubi10-v${{ env.patch_version }} \
             $(printf 'quay.io/konveyor/builder@sha256:%s ' $(ls /tmp/digests))
-
-      - name: get multi-arch manifest digest...
-        if: github.event_name != 'pull_request'
-        run: echo "MANIFEST_DIGEST=$(docker buildx imagetools inspect quay.io/konveyor/builder:ubi10-latest${{ matrix.go_version }} --format '{{.Manifest.Digest}}')" >> $GITHUB_ENV
 
       - name: generate artifact attestation...
         if: github.event_name != 'pull_request'
