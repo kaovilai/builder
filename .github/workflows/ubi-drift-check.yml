@@ -1,0 +1,266 @@
+name: 'Rebuild on UBI base image drift'
+
+# Weekly check whether the ubiN:latest base images have moved since the last
+# recorded digest. The build workflows always build FROM the current base,
+# but nothing retriggered them on base-image updates — a patched base (e.g.
+# a CVE fix) would leave published images stale until the next Go release.
+# On drift, this dispatches build.yml for every currently-shipped version of
+# the affected variants and records the new digests in
+# .github/ubi-base-digests.json (committed as github-actions[bot]).
+#
+# First run bootstraps the state file without rebuilding. Uses the builtin
+# GITHUB_TOKEN; dispatches and state commits happen only from default-branch
+# runs.
+
+on:
+  schedule:
+    - cron: '0 5 * * 6'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Log what would be rebuilt without dispatching or committing state'
+        required: false
+        type: boolean
+        default: false
+      force:
+        description: 'Rebuild every shipped version regardless of drift (testing)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: ubi-drift-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+      FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}
+    steps:
+      - name: add checkout action...
+        uses: actions/checkout@v6
+
+      - name: Check base image digests and rebuild drifted variants
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          state_file=.github/ubi-base-digests.json
+          mkdir -p "$(dirname "$state_file")"
+          [ -f "$state_file" ] || echo '{}' > "$state_file"
+
+          # UBI majors present in the repo, from the variant registry.
+          majors=$(grep -vE '^[[:space:]]*(#|$)' variants.txt | awk '{print $1}' | sort -nu)
+
+          # Manifest-list digest of each ubiN:latest base. `docker manifest
+          # inspect --verbose` returns an array for multi-platform tags, so
+          # its per-platform `.Descriptor.digest` cannot be used here;
+          # imagetools prints the list digest directly.
+          current='{}'
+          for major in $majors; do
+            digest=$(docker buildx imagetools inspect "registry.access.redhat.com/ubi${major}:latest" --format '{{.Manifest.Digest}}')
+            current=$(jq -c --arg m "$major" --arg d "$digest" '.[$m] = $d' <<< "$current")
+          done
+          echo "current base digests: $current"
+
+          # State maps each major to {applied: <digest>, pending: {digest,
+          # dispatched_at}}. `applied` advances only after a dispatched
+          # rebuild is confirmed published — a failed rebuild leaves the
+          # major pending and re-dispatched on the next run, instead of
+          # silently stranding it on a stale base forever.
+          state=$(cat "$state_file")
+          pending_majors=$(jq -r '[to_entries[] | select(.value.pending) | .key] | join(" ")' <<< "$state")
+
+          # Active tags with manifest digest and last-modified timestamp.
+          published_tags() {
+            local page=1 resp
+            while :; do
+              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
+                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
+              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest) \(.last_modified)"' | grep -v godev
+              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
+              page=$((page + 1))
+            done
+          }
+          # Newest publish time (unix seconds) per UBI major.
+          published_times() {
+            python3 - /tmp/tags.txt <<'PYEOF'
+          import re
+          import sys
+          from email.utils import parsedate_to_datetime
+
+          newest = {}
+          for line in open(sys.argv[1]):
+              # last_modified is RFC 1123 ("Thu, 05 Nov 2026 18:51:50 -0000"):
+              # split with maxsplit so its embedded spaces survive
+              parts = line.split(None, 2)
+              if len(parts) < 3:
+                  continue
+              name, when = parts[0], parsedate_to_datetime(parts[2].strip()).timestamp()
+              m = re.match(r"^ubi(\d+)", name)
+              if m:
+                  newest[m.group(1)] = max(newest.get(m.group(1), 0), when)
+          for major, when in sorted(newest.items()):
+              print(major, int(when))
+          PYEOF
+          }
+
+          needs_rebuild=""
+          if [ -n "$pending_majors" ]; then
+            # Confirm or retry previously dispatched rebuilds.
+            published_tags > /tmp/tags.txt
+            published_times > /tmp/published.tsv
+            for major in $pending_majors; do
+              pd=$(jq -r --arg m "$major" '.[$m].pending.digest // empty' <<< "$state")
+              pat=$(jq -r --arg m "$major" '.[$m].pending.dispatched_at // empty' <<< "$state")
+              pub=$(awk -v m="$major" '$1 == m {print $2}' /tmp/published.tsv)
+              if [ -n "$pub" ] && [ "$(date -d "$pat" +%s)" -lt "$pub" ]; then
+                echo "[ubi${major}] dispatched rebuild published; recording ${pd}"
+                state=$(jq -c --arg m "$major" --arg d "$pd" \
+                  '.[$m].applied = $d | .[$m] |= del(.pending)' <<< "$state")
+              else
+                echo "[ubi${major}] dispatched rebuild not published (build failed?); re-dispatching"
+                needs_rebuild="$needs_rebuild $major"
+              fi
+            done
+          fi
+
+          drifted=""
+          for major in $majors; do
+            now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
+            prev=$(jq -r --arg m "$major" '.[$m].applied // empty' <<< "$state")
+            if [ -z "$prev" ]; then
+              echo "[ubi${major}] no recorded digest (bootstrap); recording ${now}"
+            elif [ "$prev" != "$now" ]; then
+              echo "[ubi${major}] base image moved: ${prev} -> ${now}"
+              drifted="$drifted $major"
+            else
+              echo "[ubi${major}] base image unchanged (${now})"
+            fi
+          done
+
+          # force rebuilds every shipped version regardless of drift, so the
+          # target set is all majors — not just the drifted ones
+          [ "${FORCE}" = "true" ] && drifted="$majors"
+          needs_rebuild="${needs_rebuild} ${drifted}"
+
+          if [ -n "${needs_rebuild// /}" ]; then
+            # Every currently-shipped version of the affected variants:
+            # published tags grouped by manifest digest, per variant family
+            # the newest patch of each of the two newest minor versions.
+            [ -f /tmp/tags.txt ] || published_tags > /tmp/tags.txt
+            targets=$(python3 - "${needs_rebuild}" /tmp/tags.txt <<'PYEOF'
+          import re
+          import sys
+          from collections import defaultdict
+
+          drifted = set(sys.argv[1].split())
+
+          by_digest = {}
+          for line in open(sys.argv[2]):
+              parts = line.split()
+              name, digest = parts[0], parts[1]
+              by_digest.setdefault(digest, []).append(name)
+
+          def family(n):
+              fips = "-fips" if "openssl-fips" in n else ""
+              m = re.match(r"^ubi(\d+)", n)
+              return f"ubi{m.group(1) if m else '8'}{fips}"
+
+          fams = defaultdict(list)
+          for digest, names in by_digest.items():
+              versions = set()
+              for n in names:
+                  for m in re.finditer(r"v(\d+)\.(\d+)\.(\d+)", n):
+                      versions.add((int(m[1]), int(m[2]), int(m[3])))
+              fams[family(names[0])].append({"digest": digest, "tags": names, "versions": versions})
+
+          for key, entries in fams.items():
+              major = key[len("ubi"):].split("-")[0]
+              if major not in drifted:
+                  continue
+              minors = sorted({v[:2] for e in entries for v in e["versions"]}, reverse=True)[:2]
+              for minor in minors:
+                  best = None
+                  for e in entries:
+                      for v in e["versions"]:
+                          if v[:2] == minor and (best is None or v > best[0]):
+                              best = (v, e)
+                  if best:
+                      v, e = best
+                      flavor = "fips" if key.endswith("-fips") else "standard"
+                      # newest minor dispatches with empty go_version (build
+                      # latest), matching the dispatcher's convention
+                      newest = minor == minors[0]
+                      suffix = "v%d.%d.%d" % v
+                      tag = next(n for n in e["tags"] if n.endswith(suffix))
+                      print("%s %s %s %s" % (major, flavor, "LATEST" if newest else "%d.%d.%d" % v, tag))
+          PYEOF
+            )
+            dispatched=""
+            while read -r major flavor version _; do
+              [ -n "$major" ] || continue
+              [ "$version" = "LATEST" ] && version=""
+              if [ "${DRY_RUN}" = "true" ]; then
+                echo "  [dry-run] would dispatch build.yml (ubi=${major} flavor=${flavor} go_version='${version}')"
+              elif [ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+                echo "  [skip: not on ${DEFAULT_BRANCH}] would dispatch build.yml (ubi=${major} flavor=${flavor} go_version='${version}')"
+              else
+                echo "  dispatching build.yml (ubi=${major} flavor=${flavor} go_version='${version}')"
+                gh workflow run build.yml -f ubi="${major}" -f flavor="${flavor}" -f go_version="${version}"
+                dispatched="$dispatched $major"
+              fi
+            done <<< "$targets"
+
+            # Mark dispatched majors pending publish confirmation (cleared
+            # by the check above once the rebuild lands on quay).
+            dispatched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            for major in $(printf '%s\n' $dispatched | sort -u); do
+              now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
+              state=$(jq -c --arg m "$major" --arg d "$now" --arg t "$dispatched_at" \
+                '.[$m] = ((.[$m] // {}) + {pending: {digest: $d, dispatched_at: $t}})' <<< "$state")
+            done
+          else
+            echo "No base image drift; nothing to rebuild."
+          fi
+
+          # Record the state (bootstrap digests, confirmed rebuilds, pending
+          # markers) — but never on dry runs: the state must only advance
+          # when rebuilds were actually dispatched.
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "[dry-run] would record state: $state"
+            exit 0
+          fi
+          if [ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "[skip: not on ${DEFAULT_BRANCH}] would record state"
+            exit 0
+          fi
+          # bootstrap majors that had no state yet
+          for major in $majors; do
+            has=$(jq -r --arg m "$major" '.[$m].applied // empty' <<< "$state")
+            if [ -z "$has" ]; then
+              now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
+              state=$(jq -c --arg m "$major" --arg d "$now" \
+                '.[$m] = ((.[$m] // {}) + {applied: $d})' <<< "$state")
+            fi
+          done
+          jq . <<< "$state" > "$state_file"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$state_file"
+          if git diff --cached --quiet; then
+            echo "Base digest state unchanged."
+          else
+            git commit -s -m "Record UBI base image digests (generated)"
+            git pull --rebase
+            git push
+          fi
