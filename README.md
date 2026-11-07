@@ -29,14 +29,31 @@ The Dockerfiles in this repository build `quay.io/konveyor/builder` images with 
 | `Dockerfile.ubi8` | `registry.access.redhat.com/ubi8` | Go toolchain downloaded from go.dev | `ubi8-latest`, `ubi8-v1.22`, `ubi8-v1.22.3` |
 | `Dockerfile.ubi9` | `registry.access.redhat.com/ubi9` | Go toolchain downloaded from go.dev | `ubi9-latest`, `ubi9-v1.22`, `ubi9-v1.22.3` |
 | `Dockerfile.ubi10` | `registry.access.redhat.com/ubi10` | Go toolchain downloaded from go.dev | `ubi10-latest`, `ubi10-v1.22`, `ubi10-v1.22.3` |
-| `Dockerfile.ubi8-openssl-fips` | `registry.access.redhat.com/ubi8` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) for FIPS/OpenSSL support | `ubi8-openssl-fips-latest`, `ubi8-openssl-fips-v1.22`, `ubi8-openssl-fips-v1.22.3` |
-| `Dockerfile.ubi9-openssl-fips` | `registry.access.redhat.com/ubi9` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) for FIPS/OpenSSL support | `ubi9-openssl-fips-latest`, `ubi9-openssl-fips-v1.22`, `ubi9-openssl-fips-v1.22.3` |
-| `Dockerfile.ubi10-openssl-fips` | `registry.access.redhat.com/ubi10` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) for FIPS/OpenSSL support | `ubi10-openssl-fips-latest`, `ubi10-openssl-fips-v1.22`, `ubi10-openssl-fips-v1.22.3` |
+| `Dockerfile.ubi8-openssl-fips` | `registry.access.redhat.com/ubi8` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) — see [FIPS variants](#fips-variants) | `ubi8-openssl-fips-latest`, `ubi8-openssl-fips-v1.22`, `ubi8-openssl-fips-v1.22.3` |
+| `Dockerfile.ubi9-openssl-fips` | `registry.access.redhat.com/ubi9` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) — see [FIPS variants](#fips-variants) | `ubi9-openssl-fips-latest`, `ubi9-openssl-fips-v1.22`, `ubi9-openssl-fips-v1.22.3` |
+| `Dockerfile.ubi10-openssl-fips` | `registry.access.redhat.com/ubi10` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) — see [FIPS variants](#fips-variants) | `ubi10-openssl-fips-latest`, `ubi10-openssl-fips-v1.22`, `ubi10-openssl-fips-v1.22.3` |
 | `go.dev.Dockerfile.ubi9` | `quay.io/konveyor/builder:ubi9-latest` | Installs an additional Go version via `go install golang.org/dl/goX.Y.Z` on top of the UBI 9 image | built via `workflow_dispatch` on `ubi9_multi_arch_image_build_godev.yml` |
 
 All images are multi-arch (`linux/amd64`, `linux/arm64`, `linux/ppc64le`, `linux/s390x`) and are published to `quay.io/konveyor/builder`. Workflows support manual dispatch (`workflow_dispatch`) with a `go_version` input; a weekly version-aware dispatcher (`scheduled_dispatch.yml`) triggers builds when newer Go versions are released, and all workflows run on pull requests/pushes that touch the relevant Dockerfile. The version badges above are generated from the published Quay tags by `readme-badges.yml`.
 
-FIPS variants track [golang-fips/go](https://github.com/golang-fips/go) releases per supported Go minor, preferring stable releases and falling back to prereleases when a minor has no stable release yet — Go 1.27+ FIPS uses the native `crypto/fips140` module, shipped as `hostfips-release` tags.
+### FIPS variants
+
+FIPS variants track [golang-fips/go](https://github.com/golang-fips/go) releases per supported Go minor, preferring stable releases and falling back to prereleases when a minor has no stable release yet.
+
+The upstream FIPS approach changed with Go 1.27; the builder builds whatever golang-fips ships per minor:
+
+| Go | golang-fips tag | FIPS implementation |
+| --- | --- | --- |
+| up to 1.26 | `*-openssl-fips` | Cryptography routed through the OpenSSL FIPS module — deprecated upstream, historical sources live on the `go1.*-fips-release` branches ([migration notes](https://github.com/golang-fips/go#migration-to-upstream-fips-certified-cryptography)) |
+| 1.27 and newer | `*-hostfips-release` | Go's native, CMVP-certified `crypto/fips140` module with host-auto FIPS activation ([downstream modifications](https://github.com/golang-fips/go#downstream-modifications)) |
+
+Notable differences for the 1.27+ `hostfips-release` toolchains:
+
+- **Host-auto FIPS** — `GODEBUG=fips140=auto` is compiled in by default, so FIPS mode activates only when the host is booted in FIPS mode. Set [`GODEBUG=fips140=on`](https://github.com/golang-fips/go#godebugfips140) to force FIPS mode regardless of the host (upstream guidance: test with `fips140=only`, run with `on` or `auto`).
+- **Certified module by default** — builds embed the certified FIPS 140-3 snapshot ([`GOFIPS140=certified`](https://github.com/golang-fips/go#fips-module-embedding-gofips140)); ML-DSA is unavailable in certified builds until the v1.26.0 module is certified.
+- **Non-approved crypto** is recorded via the FIPS service indicator rather than producing runtime errors or panics, unlike the old OpenSSL backend.
+
+The images keep `GOEXPERIMENT=strictfipsruntime`, which the 1.27+ toolchains still honor ([strict FIPS runtime protection](https://github.com/golang-fips/go#strict-fips-runtime-protection): abort at startup when the host is in FIPS mode but `GODEBUG=fips140` is disabled).
 
 To see the most recent version of Go for EL8:  
 https://vault.centos.org/centos/8-stream/AppStream/Source/SPackages/  
