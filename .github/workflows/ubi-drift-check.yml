@@ -139,6 +139,7 @@ jobs:
                 # them (never promoting an older minor to latest). Runs
                 # before the state advance so a failed re-point leaves the
                 # major pending and retried next week.
+                repair_failed=0
                 while read -r alias was of; do
                   [ -n "$alias" ] || continue
                   # live registry value, not the /tmp/tags.txt snapshot: a
@@ -151,7 +152,11 @@ jobs:
                     --format '{{.Manifest.Digest}}' 2>/dev/null || true)
                   new_d=$(awk -v t="$of" '$1 == t {print $2; exit}' /tmp/tags.txt)
                   if [ -z "$lat_now" ]; then
-                    echo "[ubi${major}] ${alias}: could not inspect current digest; leaving it"
+                    # transient inspect failure must not clear pending: the
+                    # alias repair would never retry, so keep the major
+                    # pending and let the next run confirm + repair again
+                    echo "[ubi${major}] ${alias}: could not inspect current digest; keeping pending"
+                    repair_failed=1
                   elif [ "$lat_now" != "$was" ]; then
                     echo "[ubi${major}] ${alias} moved since dispatch; leaving it"
                   elif [ -z "$new_d" ] || [ "$new_d" = "$was" ]; then
@@ -167,8 +172,12 @@ jobs:
                     echo "[ubi${major}] re-pointed ${alias} -> ${new_d} (${of})"
                   fi
                 done < <(jq -r --arg m "$major" '.[$m].pending.latest // [] | .[] | "\(.alias) \(.was) \(.of)"' <<< "$state")
-                state=$(jq -c --arg m "$major" --arg d "$pd" \
-                  '.[$m].applied = $d | .[$m] |= del(.pending)' <<< "$state")
+                if [ "$repair_failed" = "0" ]; then
+                  state=$(jq -c --arg m "$major" --arg d "$pd" \
+                    '.[$m].applied = $d | .[$m] |= del(.pending)' <<< "$state")
+                else
+                  echo "[ubi${major}] alias repair incomplete; keeping pending for the next run"
+                fi
               else
                 echo "[ubi${major}] rebuilds not published:${missing}; re-dispatching"
                 for tag in $missing; do
