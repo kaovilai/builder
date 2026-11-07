@@ -87,7 +87,9 @@ jobs:
             while :; do
               resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
                 "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
-              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest) \(.last_modified)"' | grep -v godev
+              # godev filtered in jq: a page holding only godev tags would
+              # make grep exit 1 and abort the run
+              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | "\(.name) \(.manifest_digest) \(.last_modified)"'
               [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
               page=$((page + 1))
             done

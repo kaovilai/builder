@@ -2,12 +2,15 @@ name: 'Publish GitHub releases'
 
 # Creates one GitHub Release per published Go version (tag go<version>),
 # covering every variant shipped for it: release notes list the image tags
-# and digests, and SPDX SBOMs generated with Syft are attached as release
-# assets. The shipped set is derived from the tags published on
-# quay.io/konveyor/builder (per variant family, the newest patch of each of
-# the two newest minor versions), so a release appears once its images are
-# published and gains nothing from EOL history. Uses the builtin
-# GITHUB_TOKEN (contents: write for release creation).
+# and digests, and SPDX SBOMs generated with Syft (one per platform, since
+# a manifest-list scan only covers the runner's architecture) are attached
+# as release assets. Existing releases are reconciled weekly — notes are
+# regenerated and missing SBOMs uploaded — so variants published after a
+# release was created still land in it. The shipped set is derived from
+# the tags published on quay.io/konveyor/builder (per variant family, the
+# newest patch of each of the two newest minor versions), so a release
+# appears once its images are published and gains nothing from EOL history.
+# Uses the builtin GITHUB_TOKEN (contents: write for release creation).
 
 on:
   schedule:
@@ -45,7 +48,9 @@ jobs:
             while :; do
               resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
                 "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
-              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest)"' | grep -v godev
+              # godev filtered in jq: a page holding only godev tags would
+              # make grep exit 1 and abort the run
+              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | "\(.name) \(.manifest_digest)"'
               [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
               page=$((page + 1))
             done
@@ -98,12 +103,27 @@ jobs:
                   print("%s\t%s\t%s\t%s" % (version, family, digest, tag))
           PYEOF
 
+          # SBOMs are generated per platform (mirrors the build matrix in
+          # image-build.yml): a manifest-list scan only covers the runner's
+          # architecture otherwise. Scans skipped for assets already on the
+          # release, so weekly reconciliation only pays for what's new.
+          PLATFORMS="linux/amd64 linux/arm64 linux/ppc64le linux/s390x"
+          make_sboms() { # $1=entries $2=sbom_dir $3=file listing existing asset names
+            while IFS=$'\t' read -r _ f d t; do
+              # scan by digest: the tag is mutable and could be re-published
+              # between selection and scan, making SBOM and notes disagree
+              image="quay.io/konveyor/builder@${d}"
+              for platform in $PLATFORMS; do
+                out="${f}-${platform//\//-}.spdx.json"
+                [ -n "$3" ] && grep -qx "$out" "$3" && continue
+                docker run --rm -v "${2}:/out" docker.io/anchore/syft:1.33.0 \
+                  scan "$image" --platform "$platform" -o spdx-json --file "/out/${out}" >/dev/null
+              done
+            done <<< "$1"
+          }
+
           while IFS=$'\t' read -r version _ _ _; do
             release_tag="go${version}"
-            if gh release view "$release_tag" >/dev/null 2>&1; then
-              continue
-            fi
-            echo "Creating release ${release_tag}"
 
             # collect every shipped image of this version
             entries=$(awk -F'\t' -v v="$version" '$1 == v' /tmp/shipped.tsv)
@@ -117,24 +137,32 @@ jobs:
                 echo "| ${f} | \`${t}\` | \`${d}\` |"
               done <<< "$entries"
               echo
-              echo "SBOMs for each image are attached to this release. Attestations: https://github.com/konveyor/builder/attestations"
+              echo "SBOMs for each image and platform (${PLATFORMS// /, }) are attached to this release. Attestations: https://github.com/konveyor/builder/attestations"
             } > "$notes"
 
             sbom_dir=$(mktemp -d /tmp/sboms.XXXXXX)
-            while IFS=$'\t' read -r _ f d t; do
-              # scan by digest: the tag is mutable and could be re-published
-              # between selection and scan, making SBOM and notes disagree
-              image="quay.io/konveyor/builder@${d}"
-              docker run --rm -v "${sbom_dir}:/out" docker.io/anchore/syft:1.33.0 \
-                scan "$image" -o spdx-json --file "/out/${f}.spdx.json" >/dev/null
-            done <<< "$entries"
 
             if [ "${DRY_RUN}" = "true" ]; then
-              echo "[dry-run] would create release ${release_tag} with $(wc -l <<< "$entries") images and SBOMs"
+              echo "[dry-run] would create or reconcile release ${release_tag} with $(wc -l <<< "$entries") images"
               cat "$notes"
+            elif gh release view "$release_tag" >/dev/null 2>&1; then
+              # Reconcile: a variant published after this release was created
+              # must still land in its notes and SBOMs. Notes are regenerated
+              # (idempotent) and only missing SBOM assets are scanned+uploaded.
+              gh release view "$release_tag" --json assets -q '.assets[].name' > "${sbom_dir}/existing" || : > "${sbom_dir}/existing"
+              make_sboms "$entries" "$sbom_dir" "${sbom_dir}/existing"
+              gh release edit "$release_tag" --notes-file "$notes" >/dev/null
+              shopt -s nullglob
+              new_assets=("${sbom_dir}"/*.spdx.json)
+              if [ "${#new_assets[@]}" -gt 0 ]; then
+                gh release upload "$release_tag" "${new_assets[@]}"
+              fi
+              echo "Reconciled release ${release_tag}"
             else
+              make_sboms "$entries" "$sbom_dir" ""
               gh release create "$release_tag" --title "Go ${version} images" \
                 --notes-file "$notes" "${sbom_dir}"/*.spdx.json
+              echo "Created release ${release_tag}"
             fi
             rm -rf "$notes" "$sbom_dir"
           done < <(cut -f1 /tmp/shipped.tsv | sort -u)
