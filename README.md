@@ -12,7 +12,7 @@
 [![UBI 10](https://img.shields.io/badge/UBI_10-Go_1.27.3-blue)](https://quay.io/repository/konveyor/builder?tab=tags)
 [![UBI 8 FIPS](https://img.shields.io/badge/UBI_8_FIPS-Go_1.26.10-blueviolet)](https://quay.io/repository/konveyor/builder?tab=tags)
 [![UBI 9 FIPS](https://img.shields.io/badge/UBI_9_FIPS-Go_1.26.10-blueviolet)](https://quay.io/repository/konveyor/builder?tab=tags)
-[![UBI 10 FIPS](https://img.shields.io/badge/UBI_10_FIPS-Go_1.26.10-blueviolet)](https://quay.io/repository/konveyor/builder?tab=tags)
+[![UBI 10 FIPS](https://img.shields.io/badge/UBI_10_FIPS-Go_1.27.3-blueviolet)](https://quay.io/repository/konveyor/builder?tab=tags)
 <!-- readme-badges:end -->
 
 # Builder
