@@ -1,0 +1,142 @@
+name: 'Publish GitHub releases'
+
+# Creates one GitHub Release per published Go version (tag go<version>),
+# covering every variant shipped for it: release notes list the image tags
+# and digests, and SPDX SBOMs generated with Syft are attached as release
+# assets. The shipped set is derived from the tags published on
+# quay.io/konveyor/builder (per variant family, the newest patch of each of
+# the two newest minor versions), so a release appears once its images are
+# published and gains nothing from EOL history. Uses the builtin
+# GITHUB_TOKEN (contents: write for release creation).
+
+on:
+  schedule:
+    - cron: '0 6 * * 6'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Log the releases that would be created without creating them'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-releases
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+    steps:
+      - name: Create releases for published versions
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          published_tags() {
+            local page=1 resp
+            while :; do
+              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
+                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
+              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest)"' | grep -v godev
+              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
+              page=$((page + 1))
+            done
+          }
+
+          # Shipped set: tags grouped by manifest digest, per variant family
+          # the newest patch of each of the two newest minor versions.
+          published_tags > /tmp/tags.txt
+          python3 - /tmp/tags.txt > /tmp/shipped.tsv <<'PYEOF'
+          import re
+          import sys
+          from collections import defaultdict
+
+          by_digest = {}
+          for line in open(sys.argv[1]):
+              name, digest = line.split()
+              by_digest.setdefault(digest, []).append(name)
+
+          def family(n):
+              fips = "-fips" if "openssl-fips" in n else ""
+              m = re.match(r"^ubi(\d+)", n)
+              return f"ubi{m.group(1) if m else '8'}{fips}"
+
+          fams = defaultdict(list)
+          for digest, names in by_digest.items():
+              versions = set()
+              for n in names:
+                  for m in re.finditer(r"v(\d+)\.(\d+)\.(\d+)", n):
+                      versions.add((int(m[1]), int(m[2]), int(m[3])))
+              fams[family(names[0])].append({"digest": digest, "tags": names, "versions": versions})
+
+          # release version -> list of (family, digest, version, tag)
+          releases = defaultdict(list)
+          for key, entries in fams.items():
+              minors = sorted({v[:2] for e in entries for v in e["versions"]}, reverse=True)[:2]
+              for minor in minors:
+                  best = None
+                  for e in entries:
+                      for v in e["versions"]:
+                          if v[:2] == minor and (best is None or v > best[0]):
+                              best = (v, e)
+                  if best:
+                      v, e = best
+                      suffix = "v%d.%d.%d" % v
+                      tag = next(n for n in e["tags"] if n.endswith(suffix))
+                      releases["%d.%d.%d" % v].append((key, e["digest"], v, tag))
+
+          for version in sorted(releases):
+              for family, digest, v, tag in sorted(releases[version]):
+                  print("%s\t%s\t%s\t%s" % (version, family, digest, tag))
+          PYEOF
+
+          while IFS=$'\t' read -r version _ _ _; do
+            release_tag="go${version}"
+            if gh release view "$release_tag" >/dev/null 2>&1; then
+              continue
+            fi
+            echo "Creating release ${release_tag}"
+
+            # collect every shipped image of this version
+            entries=$(awk -F'\t' -v v="$version" '$1 == v' /tmp/shipped.tsv)
+            notes=$(mktemp /tmp/notes.XXXXXX.md)
+            {
+              echo "Images for \`quay.io/konveyor/builder\` built with Go ${version}."
+              echo
+              echo "| Variant | Tag | Digest |"
+              echo "| --- | --- | --- |"
+              while IFS=$'\t' read -r _ f d t; do
+                echo "| ${f} | \`${t}\` | \`${d}\` |"
+              done <<< "$entries"
+              echo
+              echo "SBOMs for each image are attached to this release. Attestations: https://github.com/konveyor/builder/attestations"
+            } > "$notes"
+
+            sbom_dir=$(mktemp -d /tmp/sboms.XXXXXX)
+            while IFS=$'\t' read -r _ f d t; do
+              # scan by digest: the tag is mutable and could be re-published
+              # between selection and scan, making SBOM and notes disagree
+              image="quay.io/konveyor/builder@${d}"
+              docker run --rm -v "${sbom_dir}:/out" docker.io/anchore/syft:1.33.0 \
+                scan "$image" -o spdx-json --file "/out/${f}.spdx.json" >/dev/null
+            done <<< "$entries"
+
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "[dry-run] would create release ${release_tag} with $(wc -l <<< "$entries") images and SBOMs"
+              cat "$notes"
+            else
+              gh release create "$release_tag" --title "Go ${version} images" \
+                --notes-file "$notes" "${sbom_dir}"/*.spdx.json
+            fi
+            rm -rf "$notes" "$sbom_dir"
+          done < <(cut -f1 /tmp/shipped.tsv | sort -u)
+
+          echo "Releases up to date."
