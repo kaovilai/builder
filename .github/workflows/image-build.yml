@@ -54,6 +54,13 @@ jobs:
           set -euo pipefail
           shopt -s inherit_errexit
 
+          # go_version must be empty or X.Y.Z before anything derives from it
+          # (this reusable workflow may be called by more than build.yml)
+          if [ -n "$INPUT_VERSION" ] && ! [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: go_version '$INPUT_VERSION' is not X.Y.Z"
+            exit 1
+          fi
+
           if [ "$FLAVOR" = "fips" ]; then
             # Fetch golang-fips/go releases (newest first from GitHub API)
             # Uses gh api for authenticated requests (higher rate limit)
@@ -176,10 +183,13 @@ jobs:
       matrix: ${{ fromJson(needs.determine-versions.outputs.build_matrix) }}
     steps:
       - name: Prepare
+        env:
+          # matrix fields reach scripts via env, never shell interpolation
+          VERSION_SAFE_INPUT: ${{ matrix.version_safe }}
         run: |
           platform=${{ matrix.platform }}
           echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
-          echo "VERSION_SAFE=${{ matrix.version_safe }}" >> $GITHUB_ENV
+          echo "VERSION_SAFE=$VERSION_SAFE_INPUT" >> $GITHUB_ENV
           case "${FLAVOR}:${UBI}" in
             standard:8) prefix="" ;;
             standard:*) prefix="ubi${UBI}-" ;;
@@ -260,8 +270,10 @@ jobs:
         env:
           UBI: ${{ inputs.ubi }}
           FLAVOR: ${{ inputs.flavor }}
+          # matrix fields reach scripts via env, never shell interpolation
+          VERSION_SAFE_INPUT: ${{ matrix.version_safe }}
         run: |
-          echo "VERSION_SAFE=${{ matrix.version_safe }}" >> $GITHUB_ENV
+          echo "VERSION_SAFE=$VERSION_SAFE_INPUT" >> $GITHUB_ENV
           case "${FLAVOR}:${UBI}" in
             standard:8) prefix="" ;;
             standard:*) prefix="ubi${UBI}-" ;;
