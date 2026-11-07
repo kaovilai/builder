@@ -82,7 +82,6 @@ jobs:
             fi
           done
 
-          rebuild=0
           if [ -n "$drifted" ] || [ "${FORCE}" = "true" ]; then
             # Every currently-shipped version of the drifted variants:
             # published tags grouped by manifest digest, per variant family
@@ -145,10 +144,9 @@ jobs:
                       print("%s %s %s %s" % (major, flavor, "LATEST" if newest else "%d.%d.%d" % v, tag))
           PYEOF
             )
-            while read -r major flavor version tag; do
+            while read -r major flavor version _; do
               [ -n "$major" ] || continue
               [ "$version" = "LATEST" ] && version=""
-              rebuild=1
               if [ "${DRY_RUN}" = "true" ]; then
                 echo "  [dry-run] would dispatch build.yml (ubi=${major} flavor=${flavor} go_version='${version}')"
               elif [ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then

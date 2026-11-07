@@ -98,12 +98,12 @@ jobs:
                   print("%s\t%s\t%s\t%s" % (version, family, digest, tag))
           PYEOF
 
-          while IFS=$'\t' read -r version family digest tag; do
+          while IFS=$'\t' read -r version _ _ _; do
             release_tag="go${version}"
             if gh release view "$release_tag" >/dev/null 2>&1; then
               continue
             fi
-            echo "Creating release ${release_tag} (first: ${family} ${tag})"
+            echo "Creating release ${release_tag}"
 
             # collect every shipped image of this version
             entries=$(awk -F'\t' -v v="$version" '$1 == v' /tmp/shipped.tsv)
