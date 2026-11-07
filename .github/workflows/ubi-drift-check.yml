@@ -1,0 +1,365 @@
+name: 'Rebuild on UBI base image drift'
+
+# Weekly check whether the ubiN:latest base images have moved since the last
+# recorded digest. The build workflows always build FROM the current base,
+# but nothing retriggered them on base-image updates — a patched base (e.g.
+# a CVE fix) would leave published images stale until the next Go release.
+# On drift, this dispatches build.yml for every currently-shipped version of
+# the affected variants and records the new digests in
+# .github/ubi-base-digests.json (committed as github-actions[bot]).
+#
+# First run bootstraps the state file without rebuilding. Uses the builtin
+# GITHUB_TOKEN; dispatches and state commits happen only from default-branch
+# runs.
+
+on:
+  schedule:
+    - cron: '0 5 * * 6'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Log what would be rebuilt without dispatching or committing state'
+        required: false
+        type: boolean
+        default: false
+      force:
+        description: 'Rebuild every shipped version regardless of drift (testing)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: ubi-drift-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+      FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}
+    steps:
+      - name: add checkout action...
+        uses: actions/checkout@v6
+
+      # quay push credentials for re-pointing canonical latest aliases after
+      # confirmed rebuilds (explicit-version builds only publish the
+      # versioned and latest<version> aliases)
+      - name: add quay login...
+        uses: docker/login-action@v4
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_PUBLISH_ROBOT }}
+          password: ${{ secrets.QUAY_PUBLISH_TOKEN }}
+
+      - name: Check base image digests and rebuild drifted variants
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          state_file=.github/ubi-base-digests.json
+          mkdir -p "$(dirname "$state_file")"
+          [ -f "$state_file" ] || echo '{}' > "$state_file"
+
+          # UBI majors present in the repo, from the variant registry.
+          majors=$(grep -vE '^[[:space:]]*(#|$)' variants.txt | awk '{print $1}' | sort -nu)
+
+          # Manifest-list digest of each ubiN:latest base. `docker manifest
+          # inspect --verbose` returns an array for multi-platform tags, so
+          # its per-platform `.Descriptor.digest` cannot be used here;
+          # imagetools prints the list digest directly.
+          current='{}'
+          for major in $majors; do
+            digest=$(docker buildx imagetools inspect "registry.access.redhat.com/ubi${major}:latest" --format '{{.Manifest.Digest}}')
+            current=$(jq -c --arg m "$major" --arg d "$digest" '.[$m] = $d' <<< "$current")
+          done
+          echo "current base digests: $current"
+
+          # State maps each major to {applied: <digest>, pending: {digest,
+          # dispatched_at, targets: [<tag>, ...], latest: [{alias, was,
+          # of}, ...]}}. `applied` advances only after every dispatched
+          # target tag's rebuild is confirmed republished — a failed rebuild
+          # leaves the major pending and its unpublished targets
+          # re-dispatched on the next run, instead of silently stranding
+          # them on a stale base forever. `latest` records the canonical
+          # latest aliases backing a dispatched target so confirmation can
+          # re-point them at the rebuilt digest.
+          state=$(cat "$state_file")
+          pending_majors=$(jq -r '[to_entries[] | select(.value.pending) | .key] | join(" ")' <<< "$state")
+
+          # Active tags with manifest digest and last-modified timestamp.
+          published_tags() {
+            local page=1 resp
+            while :; do
+              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
+                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
+              # godev filtered in jq: a page holding only godev tags would
+              # make grep exit 1 and abort the run
+              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | "\(.name) \(.manifest_digest) \(.last_modified)"'
+              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
+              page=$((page + 1))
+            done
+          }
+          retry_targets=/tmp/retry-targets.txt
+          : > "$retry_targets"
+          if [ -n "$pending_majors" ]; then
+            # Confirm or retry previously dispatched rebuilds — per target
+            # tag: a major advances only once every dispatched tag has been
+            # republished after the dispatch, so a failed rebuild of one
+            # flavor or version is never masked by other successful
+            # publishes. Unpublished tags are retried individually below.
+            published_tags > /tmp/tags.txt
+            for major in $pending_majors; do
+              pd=$(jq -r --arg m "$major" '.[$m].pending.digest // empty' <<< "$state")
+              pat=$(jq -r --arg m "$major" '.[$m].pending.dispatched_at // empty' <<< "$state")
+              targets=$(jq -r --arg m "$major" '.[$m].pending.targets // [] | join(" ")' <<< "$state")
+              missing=""
+              for tag in $targets; do
+                lm=$(awk -v t="$tag" '$1 == t { $1 = ""; $2 = ""; sub(/^ +/, ""); print; exit }' /tmp/tags.txt)
+                if [ -z "$lm" ] || [ "$(date -d "$pat" +%s)" -ge "$(date -d "$lm" +%s)" ]; then
+                  missing="$missing $tag"
+                fi
+              done
+              if [ -z "$missing" ]; then
+                echo "[ubi${major}] dispatched rebuilds published; recording ${pd}"
+                # Re-point canonical latest aliases that backed one of the
+                # rebuilt targets: explicit-version builds publish only the
+                # versioned and latest<version> aliases, so <prefix>latest
+                # would otherwise keep serving the stale base. Only aliases
+                # still on their dispatch-time digest are moved (never
+                # demoting a latest that a newer build has since promoted),
+                # and only onto the new digest of the target that backed
+                # them (never promoting an older minor to latest). Runs
+                # before the state advance so a failed re-point leaves the
+                # major pending and retried next week.
+                repair_failed=0
+                while read -r alias was of; do
+                  [ -n "$alias" ] || continue
+                  # live registry value, not the /tmp/tags.txt snapshot: a
+                  # build promoting latest between the snapshot and this
+                  # re-point must not be demoted. (The window between this
+                  # inspect and the create below is seconds; the registry
+                  # offers no compare-and-swap to close it entirely.)
+                  lat_now=$(docker buildx imagetools inspect \
+                    "quay.io/konveyor/builder:${alias}" \
+                    --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+                  new_d=$(awk -v t="$of" '$1 == t {print $2; exit}' /tmp/tags.txt)
+                  if [ -z "$lat_now" ]; then
+                    # transient inspect failure must not clear pending: the
+                    # alias repair would never retry, so keep the major
+                    # pending and let the next run confirm + repair again
+                    echo "[ubi${major}] ${alias}: could not inspect current digest; keeping pending"
+                    repair_failed=1
+                  elif [ "$lat_now" != "$was" ]; then
+                    echo "[ubi${major}] ${alias} moved since dispatch; leaving it"
+                  elif [ -z "$new_d" ] || [ "$new_d" = "$was" ]; then
+                    echo "[ubi${major}] ${alias}: ${of} not republished with a new digest; leaving it"
+                  elif [ "${DRY_RUN}" = "true" ]; then
+                    echo "[dry-run] would re-point ${alias} -> ${new_d} (${of})"
+                  elif [ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+                    echo "[skip: not on ${DEFAULT_BRANCH}] would re-point ${alias} -> ${new_d} (${of})"
+                  else
+                    docker buildx imagetools create \
+                      -t "quay.io/konveyor/builder:${alias}" \
+                      "quay.io/konveyor/builder@${new_d}"
+                    echo "[ubi${major}] re-pointed ${alias} -> ${new_d} (${of})"
+                  fi
+                done < <(jq -r --arg m "$major" '.[$m].pending.latest // [] | .[] | "\(.alias) \(.was) \(.of)"' <<< "$state")
+                if [ "$repair_failed" = "0" ]; then
+                  state=$(jq -c --arg m "$major" --arg d "$pd" \
+                    '.[$m].applied = $d | .[$m] |= del(.pending)' <<< "$state")
+                else
+                  echo "[ubi${major}] alias repair incomplete; keeping pending for the next run"
+                fi
+              else
+                echo "[ubi${major}] rebuilds not published:${missing}; re-dispatching"
+                for tag in $missing; do
+                  case "$tag" in
+                    *openssl-fips*) flavor="fips" ;;
+                    *) flavor="standard" ;;
+                  esac
+                  version=$(sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+)$/\1/' <<< "$tag")
+                  printf '%s %s %s %s\n' "$major" "$flavor" "$version" "$tag" >> "$retry_targets"
+                done
+              fi
+            done
+          fi
+
+          drifted=""
+          for major in $majors; do
+            now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
+            # Compare against the pending digest while a rebuild round is in
+            # flight: `applied` still holds the pre-drift digest then, and
+            # using it would re-dispatch already-published flavors every
+            # week until the whole round lands. A genuinely new base digest
+            # observed mid-pending still drifts (and re-dispatches) here.
+            prev=$(jq -r --arg m "$major" '.[$m].pending.digest // .[$m].applied // empty' <<< "$state")
+            if [ -z "$prev" ]; then
+              echo "[ubi${major}] no recorded digest (bootstrap); recording ${now}"
+            elif [ "$prev" != "$now" ]; then
+              echo "[ubi${major}] base image moved: ${prev} -> ${now}"
+              drifted="$drifted $major"
+            else
+              echo "[ubi${major}] base image unchanged (${now})"
+            fi
+          done
+
+          # force rebuilds every shipped version regardless of drift, so the
+          # target set is all majors — not just the drifted ones
+          [ "${FORCE}" = "true" ] && drifted="$majors"
+
+          if [ -n "${drifted}" ] || [ -s "$retry_targets" ]; then
+            # Every currently-shipped version of the affected variants:
+            # published tags grouped by manifest digest, per variant family
+            # the newest patch of each of the two newest minor versions.
+            # Unpublished retry targets from the confirmation above are
+            # prepended verbatim (retry only what failed, not the whole
+            # family) and deduped against fresh drift dispatches.
+            [ -f /tmp/tags.txt ] || published_tags > /tmp/tags.txt
+            selector_out=$(python3 - "${drifted}" /tmp/tags.txt <<'PYEOF'
+          import re
+          import sys
+          from collections import defaultdict
+
+          drifted = set(sys.argv[1].split())
+
+          by_digest = {}
+          for line in open(sys.argv[2]):
+              parts = line.split()
+              name, digest = parts[0], parts[1]
+              by_digest.setdefault(digest, []).append(name)
+
+          def family(n):
+              fips = "-fips" if "openssl-fips" in n else ""
+              m = re.match(r"^ubi(\d+)", n)
+              return f"ubi{m.group(1) if m else '8'}{fips}"
+
+          fams = defaultdict(list)
+          for digest, names in by_digest.items():
+              versions = set()
+              for n in names:
+                  for m in re.finditer(r"v(\d+)\.(\d+)\.(\d+)", n):
+                      versions.add((int(m[1]), int(m[2]), int(m[3])))
+              fams[family(names[0])].append({"digest": digest, "tags": names, "versions": versions})
+
+          for key, entries in fams.items():
+              major = key[len("ubi"):].split("-")[0]
+              if major not in drifted:
+                  continue
+              minors = sorted({v[:2] for e in entries for v in e["versions"]}, reverse=True)[:2]
+              for minor in minors:
+                  best = None
+                  for e in entries:
+                      for v in e["versions"]:
+                          if v[:2] == minor and (best is None or v > best[0]):
+                              best = (v, e)
+                  if best:
+                      v, e = best
+                      flavor = "fips" if key.endswith("-fips") else "standard"
+                      # Rebuild the exact published version: an empty
+                      # go_version would build the latest upstream release,
+                      # skipping the selected shipped version whenever
+                      # upstream has moved past it. New upstream versions
+                      # are the scheduled dispatcher's job, not this check's.
+                      suffix = "v%d.%d.%d" % v
+                      tag = next(n for n in e["tags"] if n.endswith(suffix))
+                      print("%s %s %d.%d.%d %s" % (major, flavor, v[0], v[1], v[2], tag))
+          PYEOF
+            )
+            targets=$( { cat "$retry_targets"; echo "$selector_out"; } | sed '/^$/d' | sort -u)
+            : > /tmp/dispatched.txt
+            while read -r major flavor version tag; do
+              [ -n "$major" ] || continue
+              if [ "${DRY_RUN}" = "true" ]; then
+                echo "  [dry-run] would dispatch build.yml (ubi=${major} flavor=${flavor} go_version='${version}')"
+              elif [ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+                echo "  [skip: not on ${DEFAULT_BRANCH}] would dispatch build.yml (ubi=${major} flavor=${flavor} go_version='${version}')"
+              else
+                echo "  dispatching build.yml (ubi=${major} flavor=${flavor} go_version='${version}')"
+                gh workflow run build.yml -f ubi="${major}" -f flavor="${flavor}" -f go_version="${version}"
+                printf '%s %s %s\n' "$major" "$flavor" "$tag" >> /tmp/dispatched.txt
+              fi
+            done <<< "$targets"
+
+            # Mark dispatched majors pending publish confirmation, recording
+            # the exact target tags — cleared by the per-tag check above only
+            # once every one of them has been republished on quay.
+            dispatched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            while read -r major; do
+              targets_json=$(awk -v m="$major" '$1 == m {print $3}' /tmp/dispatched.txt | sort -u | jq -R . | jq -sc .)
+              # canonical latest aliases backing one of the dispatched
+              # targets, so confirmation can re-point them at the rebuilt
+              # digest (explicit-version builds publish only the versioned
+              # and latest<version> aliases)
+              latest_json="[]"
+              while read -r flavor; do
+                case "${major}:${flavor}" in
+                  8:standard) prefix="" ;;
+                  8:fips)     prefix="openssl-fips-" ;;
+                  *:standard) prefix="ubi${major}-" ;;
+                  *)          prefix="ubi${major}-openssl-fips-" ;;
+                esac
+                alias="${prefix}latest"
+                lat_d=$(awk -v t="$alias" '$1 == t {print $2; exit}' /tmp/tags.txt)
+                [ -n "$lat_d" ] || continue
+                while read -r t; do
+                  if [ "$(awk -v x="$t" '$1 == x {print $2; exit}' /tmp/tags.txt)" = "$lat_d" ]; then
+                    latest_json=$(jq -c --arg a "$alias" --arg w "$lat_d" --arg o "$t" \
+                      '. + [{alias: $a, was: $w, of: $o}]' <<< "$latest_json")
+                    break
+                  fi
+                done < <(awk -v m="$major" -v f="$flavor" '$1 == m && $2 == f {print $3}' /tmp/dispatched.txt)
+              done < <(awk -v m="$major" '$1 == m {print $2}' /tmp/dispatched.txt | sort -u)
+              now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
+              # union with the existing pending.latest by alias (new wins):
+              # a partial retry dispatches only the unpublished tags, and
+              # its fresh mappings can't cover an alias backed by an
+              # already-published target — dropping that mapping would
+              # strand the alias on the stale base forever
+              merged_latest=$(jq -c --arg m "$major" --argjson lt "$latest_json" \
+                '($lt) + [(.[$m].pending.latest // [])[] | select(.alias as $a | ($lt | map(.alias) | index($a)) | not)]' <<< "$state")
+              state=$(jq -c --arg m "$major" --arg d "$now" --arg t "$dispatched_at" --argjson tg "$targets_json" --argjson lt "$merged_latest" \
+                '.[$m] = ((.[$m] // {}) + {pending: {digest: $d, dispatched_at: $t, targets: $tg, latest: $lt}})' <<< "$state")
+            done < <(awk '{print $1}' /tmp/dispatched.txt | sort -u)
+          else
+            echo "No base image drift; nothing to rebuild."
+          fi
+
+          # Record the state (bootstrap digests, confirmed rebuilds, pending
+          # markers) — but never on dry runs: the state must only advance
+          # when rebuilds were actually dispatched.
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "[dry-run] would record state: $state"
+            exit 0
+          fi
+          if [ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "[skip: not on ${DEFAULT_BRANCH}] would record state"
+            exit 0
+          fi
+          # bootstrap majors that had no state yet
+          for major in $majors; do
+            has=$(jq -r --arg m "$major" '.[$m].applied // empty' <<< "$state")
+            if [ -z "$has" ]; then
+              now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
+              state=$(jq -c --arg m "$major" --arg d "$now" \
+                '.[$m] = ((.[$m] // {}) + {applied: $d})' <<< "$state")
+            fi
+          done
+          jq . <<< "$state" > "$state_file"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$state_file"
+          if git diff --cached --quiet; then
+            echo "Base digest state unchanged."
+          else
+            git commit -s -m "Record UBI base image digests (generated)"
+            git pull --rebase
+            git push
+          fi

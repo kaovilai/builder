@@ -1,0 +1,196 @@
+name: 'Publish GitHub releases'
+
+# Creates one GitHub Release per published Go version (tag go<version>),
+# covering every variant shipped for it: release notes list the image tags
+# and digests, and SPDX SBOMs generated with Syft (one per platform, since
+# a manifest-list scan only covers the runner's architecture) are attached
+# as release assets. Existing releases are reconciled weekly — notes are
+# regenerated and missing SBOMs uploaded — so variants published after a
+# release was created still land in it. The shipped set is derived from
+# the tags published on quay.io/konveyor/builder (per variant family, the
+# newest patch of each of the two newest minor versions), so a release
+# appears once its images are published and gains nothing from EOL history.
+# Uses the builtin GITHUB_TOKEN (contents: write for release creation).
+
+on:
+  schedule:
+    - cron: '0 6 * * 6'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Log the releases that would be created without creating them'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-releases
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+    steps:
+      - name: Create releases for published versions
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          published_tags() {
+            local page=1 resp
+            while :; do
+              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
+                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
+              # godev filtered in jq: a page holding only godev tags would
+              # make grep exit 1 and abort the run
+              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | "\(.name) \(.manifest_digest)"'
+              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
+              page=$((page + 1))
+            done
+          }
+
+          # Shipped set: tags grouped by manifest digest, per variant family
+          # the newest patch of each of the two newest minor versions.
+          published_tags > /tmp/tags.txt
+          python3 - /tmp/tags.txt > /tmp/shipped.tsv <<'PYEOF'
+          import re
+          import sys
+          from collections import defaultdict
+
+          by_digest = {}
+          for line in open(sys.argv[1]):
+              name, digest = line.split()
+              by_digest.setdefault(digest, []).append(name)
+
+          def family(n):
+              fips = "-fips" if "openssl-fips" in n else ""
+              m = re.match(r"^ubi(\d+)", n)
+              return f"ubi{m.group(1) if m else '8'}{fips}"
+
+          fams = defaultdict(list)
+          for digest, names in by_digest.items():
+              versions = set()
+              for n in names:
+                  for m in re.finditer(r"v(\d+)\.(\d+)\.(\d+)", n):
+                      versions.add((int(m[1]), int(m[2]), int(m[3])))
+              fams[family(names[0])].append({"digest": digest, "tags": names, "versions": versions})
+
+          # release version -> list of (family, digest, version, tag)
+          releases = defaultdict(list)
+          for key, entries in fams.items():
+              minors = sorted({v[:2] for e in entries for v in e["versions"]}, reverse=True)[:2]
+              for minor in minors:
+                  best = None
+                  for e in entries:
+                      for v in e["versions"]:
+                          if v[:2] == minor and (best is None or v > best[0]):
+                              best = (v, e)
+                  if best:
+                      v, e = best
+                      suffix = "v%d.%d.%d" % v
+                      tag = next(n for n in e["tags"] if n.endswith(suffix))
+                      releases["%d.%d.%d" % v].append((key, e["digest"], v, tag))
+
+          for version in sorted(releases):
+              for family, digest, v, tag in sorted(releases[version]):
+                  print("%s\t%s\t%s\t%s" % (version, family, digest, tag))
+          PYEOF
+
+          # SBOMs are generated per platform (mirrors the build matrix in
+          # image-build.yml): a manifest-list scan only covers the runner's
+          # architecture otherwise. Asset names carry the image digest — a
+          # rebuild republishing the same version with a new digest produces
+          # new asset names, so reconciliation rescans them instead of
+          # skipping on the unchanged name. Scans are skipped only for
+          # assets already on the release.
+          PLATFORMS="linux/amd64 linux/arm64 linux/ppc64le linux/s390x"
+          expected_assets() { # $1=entries — must match make_sboms' naming
+            while IFS=$'\t' read -r _ f d t; do
+              for platform in $PLATFORMS; do
+                echo "${f}-${platform//\//-}-${d#sha256:}.spdx.json"
+              done
+            done <<< "$1"
+          }
+          make_sboms() { # $1=entries $2=sbom_dir $3=file listing existing asset names
+            while IFS=$'\t' read -r _ f d t; do
+              # scan by digest: the tag is mutable and could be re-published
+              # between selection and scan, making SBOM and notes disagree
+              image="quay.io/konveyor/builder@${d}"
+              for platform in $PLATFORMS; do
+                out="${f}-${platform//\//-}-${d#sha256:}.spdx.json"
+                [ -n "$3" ] && grep -qx "$out" "$3" && continue
+                docker run --rm -v "${2}:/out" docker.io/anchore/syft:1.33.0 \
+                  scan "$image" --platform "$platform" -o spdx-json --file "/out/${out}" >/dev/null
+              done
+            done <<< "$1"
+          }
+
+          while IFS=$'\t' read -r version _ _ _; do
+            release_tag="go${version}"
+
+            # collect every shipped image of this version
+            entries=$(awk -F'\t' -v v="$version" '$1 == v' /tmp/shipped.tsv)
+            notes=$(mktemp /tmp/notes.XXXXXX.md)
+            {
+              echo "Images for \`quay.io/konveyor/builder\` built with Go ${version}."
+              echo
+              echo "| Variant | Tag | Digest |"
+              echo "| --- | --- | --- |"
+              while IFS=$'\t' read -r _ f d t; do
+                echo "| ${f} | \`${t}\` | \`${d}\` |"
+              done <<< "$entries"
+              echo
+              echo "SBOMs for each image and platform (${PLATFORMS// /, }) are attached to this release. Attestations: https://github.com/konveyor/builder/attestations"
+            } > "$notes"
+
+            sbom_dir=$(mktemp -d /tmp/sboms.XXXXXX)
+
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "[dry-run] would create or reconcile release ${release_tag} with $(wc -l <<< "$entries") images"
+              cat "$notes"
+            elif gh release view "$release_tag" >/dev/null 2>&1; then
+              # Reconcile: a variant published after this release was created
+              # must still land in its notes and SBOMs. Notes are regenerated
+              # (idempotent), only missing SBOM assets are scanned+uploaded
+              # (digest-named, so a rebuilt image rescans), and SBOM assets
+              # that no longer match the shipped set are pruned.
+              expected=$(mktemp /tmp/expected.XXXXXX)
+              expected_assets "$entries" > "$expected"
+              existing="${sbom_dir}/existing"
+              gh release view "$release_tag" --json assets -q '.assets[].name' > "$existing" || : > "$existing"
+              make_sboms "$entries" "$sbom_dir" "$existing"
+              gh release edit "$release_tag" --notes-file "$notes" >/dev/null
+              shopt -s nullglob
+              new_assets=("${sbom_dir}"/*.spdx.json)
+              if [ "${#new_assets[@]}" -gt 0 ]; then
+                gh release upload "$release_tag" "${new_assets[@]}"
+              fi
+              while read -r asset; do
+                case "$asset" in
+                  *.spdx.json)
+                    if ! grep -qx "$asset" "$expected"; then
+                      gh release delete-asset "$release_tag" "$asset" --yes
+                      echo "pruned stale SBOM asset ${asset}"
+                    fi
+                    ;;
+                esac
+              done < "$existing"
+              rm -f "$expected"
+              echo "Reconciled release ${release_tag}"
+            else
+              make_sboms "$entries" "$sbom_dir" ""
+              gh release create "$release_tag" --title "Go ${version} images" \
+                --notes-file "$notes" "${sbom_dir}"/*.spdx.json
+              echo "Created release ${release_tag}"
+            fi
+            rm -rf "$notes" "$sbom_dir"
+          done < <(cut -f1 /tmp/shipped.tsv | sort -u)
+
+          echo "Releases up to date."
