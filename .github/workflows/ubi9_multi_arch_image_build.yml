@@ -24,6 +24,9 @@ jobs:
       - name: Determine Go versions to build
         id: set-matrix
         run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             # On pull_request, build latest (empty) plus all previous supported Go versions.
             # Go supports two major releases at a time. The go.dev API returns one entry

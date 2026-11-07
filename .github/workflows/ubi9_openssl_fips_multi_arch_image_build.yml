@@ -27,6 +27,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
           # Fetch golang-fips/go releases (newest first from GitHub API)
           # Uses gh api for authenticated requests (higher rate limit)
           fips_releases=$(gh api repos/golang-fips/go/releases --paginate | jq -s 'add')
