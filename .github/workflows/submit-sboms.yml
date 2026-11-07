@@ -19,7 +19,9 @@ name: 'Submit image SBOMs to the dependency graph'
 # sbom-action's default dependency-snapshot correlator is workflow_job,
 # which is identical across matrix legs — GitHub would keep only the latest
 # snapshot per correlator, i.e. one image. Each leg therefore passes an
-# explicit correlator derived from its image.
+# explicit correlator derived from its image and pinned to its version slot
+# (major.minor), so patch updates replace the slot's snapshot rather than
+# accumulating a new stream per patch.
 #
 # Runs weekly, on demand, and after each publish (dispatched by the build
 # workflows' merge jobs, with cancel-in-progress collapsing the queue so a
@@ -57,7 +59,7 @@ jobs:
             while :; do
               resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
                 "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
-              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest)"'
+              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest)"' | grep -v godev
               [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
               page=$((page + 1))
             done
@@ -106,9 +108,13 @@ jobs:
           for digest, (v, e) in selected.items():
               suffix = "v%d.%d.%d" % v
               tag = next(n for n in e["tags"] if n.endswith(suffix))
+              # correlator is stable per variant slot (major.minor): a new
+              # patch of the same minor replaces the slot's previous snapshot
+              # instead of opening a new stream that accumulates forever
+              slot_tag = tag.rsplit(".", 1)[0]
               include.append({
                   "image": f"quay.io/konveyor/builder:{tag}",
-                  "correlator": re.sub(r"[^a-zA-Z0-9]+", "-", f"konveyor-builder-{tag}"),
+                  "correlator": re.sub(r"[^a-zA-Z0-9]+", "-", f"konveyor-builder-{slot_tag}"),
               })
           print(json.dumps({"include": sorted(include, key=lambda x: x["image"])}))
           PYEOF
