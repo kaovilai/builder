@@ -253,8 +253,10 @@ jobs:
     # image (native platform, served from the build job's GHA cache),
     # verifying the consumer contract: toolchain present, cgo works,
     # output correct — and for the fips flavor, that FIPS enforcement is
-    # actually engaged. Gates the publish path.
-    needs: determine-versions
+    # actually engaged. Gates the publish path. Waits for the build matrix
+    # so its GHA cache exists — otherwise this is a full rebuild (a whole
+    # golang-fips compile for the fips flavor).
+    needs: [determine-versions, build]
     runs-on: ubuntu-latest
     env:
       UBI: ${{ inputs.ubi }}
@@ -272,21 +274,20 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: build image for the e2e test...
-        # Native platform only; the build job's cache makes this a
-        # near-instant rebuild of the already-built amd64 image.
-        env:
-          BUILD_ARG: ${{ matrix.build_arg }}
-        run: |
-          set -euo pipefail
-          docker buildx build \
-            --platform linux/amd64 \
-            --file "$DOCKERFILE" \
-            --build-arg UBI_MAJOR="$UBI" \
-            --build-arg "$BUILD_ARG" \
-            --cache-from "type=gha,scope=${CACHE_SCOPE}-linux-amd64" \
-            --tag builder-e2e:test \
-            --load \
-            .
+        # Native platform only, served from the build job's GHA cache via
+        # build-push-action, which hands the gha cache backend the runtime
+        # token/URL that a raw `buildx build` step lacks.
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          platforms: linux/amd64
+          load: true
+          tags: builder-e2e:test
+          cache-from: type=gha,scope=${{ env.CACHE_SCOPE }}-linux-amd64
+          build-args: |
+            UBI_MAJOR=${{ inputs.ubi }}
+            ${{ matrix.build_arg }}
 
       - name: compile and run a cgo app in the image...
         run: |
