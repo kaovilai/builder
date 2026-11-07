@@ -57,7 +57,7 @@ jobs:
       count: ${{ steps.set.outputs.count }}
     steps:
       - name: add checkout action...
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # full history so the event's base commit is available for diffing
           fetch-depth: 0

@@ -201,7 +201,7 @@ jobs:
           echo "PREFIX=$prefix" >> $GITHUB_ENV
 
       - name: add checkout action...
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: configure QEMU action...
         if: matrix.platform == 'linux/ppc64le' || matrix.platform == 'linux/s390x'
@@ -243,7 +243,7 @@ jobs:
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: upload digest...
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: digests-${{ env.CACHE_SCOPE }}-${{ env.PLATFORM_PAIR }}-${{ env.VERSION_SAFE }}
           path: /tmp/digests/*
@@ -270,7 +270,7 @@ jobs:
       matrix: ${{ fromJson(needs.determine-versions.outputs.matrix) }}
     steps:
       - name: add checkout action...
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: configure buildx action...
         uses: docker/setup-buildx-action@v4
@@ -418,7 +418,7 @@ jobs:
           echo "PREFIX=$prefix" >> $GITHUB_ENV
 
       - name: download digests...
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
           pattern: digests-${{ env.CACHE_SCOPE }}-*-${{ env.VERSION_SAFE }}
