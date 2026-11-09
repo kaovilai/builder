@@ -31,11 +31,15 @@ QUAY_TOKEN=$(curl -sfS --retry 3 \
 list=$(curl -sfS --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
   -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" \
   "https://quay.io/v2/konveyor/builder/manifests/$DIGEST")
-plat=$(jq -r '.manifests[0].digest' <<< "$list")
-plat=$(curl -sfS --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
-  -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
-  "https://quay.io/v2/konveyor/builder/manifests/$plat")
-cfg=$(jq -r '.config.digest' <<< "$plat")
+if jq -e 'has("manifests")' <<< "$list" >/dev/null; then
+  # a manifest list: descend to the first platform's manifest
+  plat=$(jq -r '.manifests[0].digest' <<< "$list")
+  list=$(curl -sfS --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
+    -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+    "https://quay.io/v2/konveyor/builder/manifests/$plat")
+fi
+# a single-platform tag resolves straight to a manifest
+cfg=$(jq -r '.config.digest' <<< "$list")
 label=$(curl -sfSL --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
   "https://quay.io/v2/konveyor/builder/blobs/$cfg" \
   | jq -r '.config.Labels["io.konveyor.builder.go-fips-source"] // ""')

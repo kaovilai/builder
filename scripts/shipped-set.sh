@@ -38,7 +38,8 @@ published_tags() {
 
 # --raw: emit every active tag as "name digest last_modified" instead
 # of the selected shipped set (the drift check's publish confirmation
-# looks up tags that may have left the shipped set)
+# looks up tags that may have left the shipped set). Like the default
+# mode, names containing "godev" are excluded.
 # --from <file>: select from a --raw snapshot instead of a fresh crawl,
 # so callers that also use the snapshot directly (the drift check's
 # alias bookkeeping) never see selection and bookkeeping disagree
@@ -91,13 +92,20 @@ for key, entries in fams.items():
     flavor = "fips" if key.endswith("-fips") else "standard"
     minors = sorted({v[:2] for e in entries for v in e["versions"]}, reverse=True)[:2]
     for minor in minors:
+        # key: version, then plain-tag preference — a graduation window
+        # can leave both the -pre and the plain tag of the same version
+        # active, and the plain one is the stable replacement
         best = None
         for e in entries:
+            is_pre = any(n.endswith("-pre") for n in e["tags"])
             for v in e["versions"]:
-                if v[:2] == minor and (best is None or v > best[0]):
-                    best = (v, e)
+                if v[:2] != minor:
+                    continue
+                k = (v, not is_pre)
+                if best is None or k > best[0]:
+                    best = (k, v, e)
         if best:
-            v, e = best
+            _, v, e = best
             suffix = "v%d.%d.%d" % v
             tag = next(n for n in e["tags"] if n.endswith(suffix) or n.endswith(suffix + "-pre"))
             version = "%d.%d.%d" % v

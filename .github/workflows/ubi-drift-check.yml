@@ -279,13 +279,40 @@ jobs:
                 for alias in "${prefix}latest" "${prefix}latest-pre"; do
                   lat_d=$(awk -v t="$alias" '$1 == t {print $2; exit}' /tmp/tags.txt)
                   [ -n "$lat_d" ] || continue
+                  case "$alias" in
+                    *-pre) kind="-pre" ;;
+                    *)     kind="" ;;
+                  esac
+                  matched=""
                   while read -r t; do
                     if [ "$(awk -v x="$t" '$1 == x {print $2; exit}' /tmp/tags.txt)" = "$lat_d" ]; then
                       latest_json=$(jq -c --arg a "$alias" --arg w "$lat_d" --arg o "$t" \
                         '. + [{alias: $a, was: $w, of: $o}]' <<< "$latest_json")
+                      matched=1
                       break
                     fi
                   done < <(awk -v m="$major" -v f="$flavor" '$1 == m && $2 == f {print $3}' /tmp/dispatched.txt)
+                  if [ -n "$matched" ]; then
+                    continue
+                  fi
+                  # The alias serves an older patch than the selected
+                  # target (a rebuild can select a newer patch without
+                  # the alias advancing). Re-point it to this family's
+                  # newest dispatched target of the alias's kind, so the
+                  # rebuild refreshes it — but never demote an alias
+                  # already serving a newer promotion.
+                  newest=$(awk -v m="$major" -v f="$flavor" '$1 == m && $2 == f {print $3}' /tmp/dispatched.txt \
+                    | grep -E -- "v[0-9.]+${kind}\$" | sort -V | tail -1)
+                  [ -n "$newest" ] || continue
+                  newest_v=$(sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/' <<< "$newest")
+                  # exclude the alias itself: it shares the digest it serves
+                  lat_tag=$(awk -v d="$lat_d" -v a="$alias" '$2 == d && $1 != a {print $1; exit}' /tmp/tags.txt)
+                  lat_v=$(sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/' <<< "$lat_tag")
+                  if [ -n "$lat_v" ] && [ "$newest_v" != "$lat_v" ] \
+                    && [ "$(printf '%s\n%s\n' "$lat_v" "$newest_v" | sort -V | tail -1)" = "$newest_v" ]; then
+                    latest_json=$(jq -c --arg a "$alias" --arg w "$lat_d" --arg o "$newest" \
+                      '. + [{alias: $a, was: $w, of: $o}]' <<< "$latest_json")
+                  fi
                 done
               done < <(awk -v m="$major" '$1 == m {print $2}' /tmp/dispatched.txt | sort -u)
               now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")

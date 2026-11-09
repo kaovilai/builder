@@ -21,7 +21,19 @@ set -euo pipefail
 # of failing the run.
 shopt -s inherit_errexit
 
-FIPS_RELEASES=$(gh api repos/golang-fips/go/releases --paginate | jq -s 'add')
+# the lookup owns its retries (CONTRIBUTING): a transient gh failure
+# discards any partial result and retries the complete pagination
+FIPS_RELEASES=""
+for attempt in 1 2 3; do
+  if FIPS_RELEASES=$(gh api repos/golang-fips/go/releases --paginate | jq -s 'add'); then
+    break
+  fi
+  if [ "$attempt" -eq 3 ]; then
+    echo "ERROR: golang-fips release lookup failed after 3 attempts" >&2
+    exit 1
+  fi
+  sleep 10
+done
 
 JQ='
   def vkey: (.tag | split("-")[0] | ltrimstr("go") | split(".") | map(tonumber));
