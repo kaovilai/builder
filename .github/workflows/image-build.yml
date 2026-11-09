@@ -96,7 +96,10 @@ jobs:
                   '{include: [{build_arg: ("FIPS_TAG=" + $sel.tag), version_safe: ($sel.tag | gsub("/"; "-")), tag_suffix: $s, pre: $sel.pre}]}')
               else
                 # Empty input = latest (best release of the newest minor)
-                fips_sel=$(scripts/go-fips-releases.sh --top2 | jq -c '.[0]')
+                # // empty: an empty top2 makes .[0] null, which would
+                # sail past the guard as the literal string "null" and
+                # fail later in gsub
+                fips_sel=$(scripts/go-fips-releases.sh --top2 | jq -c '.[0] // empty')
                 if [ -z "$fips_sel" ]; then
                   echo "ERROR: No golang-fips releases matched the candidate filter"
                   exit 1

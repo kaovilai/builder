@@ -39,6 +39,9 @@ published_tags() {
 # --raw: emit every active tag as "name digest last_modified" instead
 # of the selected shipped set (the drift check's publish confirmation
 # looks up tags that may have left the shipped set)
+# --from <file>: select from a --raw snapshot instead of a fresh crawl,
+# so callers that also use the snapshot directly (the drift check's
+# alias bookkeeping) never see selection and bookkeeping disagree
 if [ "${1:-}" = "--raw" ]; then
   published_tags
   exit 0
@@ -48,7 +51,11 @@ fi
 # stdin via the heredoc below, so the tags cannot also be piped in
 TAGS_FILE=$(mktemp /tmp/shipped-set-tags.XXXXXX)
 trap 'rm -f "$TAGS_FILE"' EXIT
-published_tags > "$TAGS_FILE"
+if [ "${1:-}" = "--from" ]; then
+  cat "${2:?--from needs a file}" > "$TAGS_FILE"
+else
+  published_tags > "$TAGS_FILE"
+fi
 
 python3 - "$TAGS_FILE" <<'PYEOF'
 import re

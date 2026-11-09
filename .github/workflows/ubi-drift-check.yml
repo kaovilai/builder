@@ -230,7 +230,11 @@ jobs:
             # prepended verbatim (retry only what failed, not the whole
             # family) and deduped against fresh drift dispatches.
             [ -f /tmp/tags.txt ] || scripts/shipped-set.sh --raw > /tmp/tags.txt
-            selector_out=$(scripts/shipped-set.sh \
+            # selected from the SAME snapshot the alias bookkeeping reads
+            # below — a fresh crawl could pick up a publish that advanced
+            # latest between the two, leaving the new patch without an
+            # alias mapping and latest stale after the rebuild
+            selector_out=$(scripts/shipped-set.sh --from /tmp/tags.txt \
               | awk -F'\t' -v want="${drifted}" \
                   'BEGIN { n = split(want, w, " "); for (i = 1; i <= n; i++) wanted[w[i]] = 1 }
                    # space-separated to match the retry-target format, so
