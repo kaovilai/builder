@@ -45,10 +45,12 @@ jobs:
           # tag list instead of failing the run.
           shopt -s inherit_errexit
 
-          # Shipped set: the shared selector (scripts/shipped-set.sh) —
-          # one row per shipped image:
-          # version major flavor family digest tag last_modified newest
-          scripts/shipped-set.sh > /tmp/shipped.tsv
+          # Per-kind published latest: the shared selector's
+          # --latest-by-kind mode (see CONTRIBUTING) — one row per
+          # family per tag kind, the newest patch tag of that kind,
+          # kind-filtered BEFORE the per-minor reduction (a family can
+          # publish stable 1.27.2 next to 1.27.3-pre).
+          scripts/shipped-set.sh --latest-by-kind > /tmp/latest-by-kind.tsv
 
           # golang-fips source releases (same candidate filter as
           # image-build.yml's FIPS selection), so FIPS badges can say
@@ -72,22 +74,19 @@ jobs:
                     }
 
           # Latest published Go version per image variant. Empty when the variant
-          # Newest shipped row of a variant family — empty when the
-          # family has no shipped image yet (awk prints nothing and the
-          # pipeline needs `|| true` to keep set -e from aborting).
-          # $2 selects the row kind: "plain" (stable tags only), "pre"
-          # (-pre tags only), empty (any kind — the standard-variant
-          # badge and the pre-split FIPS lookup)
-          latest_for() { # $1 = family, $2 = kind → "<version>\t<digest>\t<tag>\t<last_modified>" of the newest matching row
-            awk -F'\t' -v f="$1" -v k="${2:-}" \
-              '$4 == f && (k == "" || (k == "pre") == ($6 ~ /-pre$/)) {print $1"\t"$5"\t"$6"\t"$7}' /tmp/shipped.tsv \
+          # Newest row of a variant family and tag kind ("plain"/"pre")
+          # from the selector's --latest-by-kind output — empty when the
+          # family has nothing published of that kind (awk prints nothing
+          # and the pipeline needs `|| true` to keep set -e from aborting).
+          latest_for() { # $1 = family, $2 = kind → "<version>\t<digest>\t<tag>\t<last_modified>" of the newest row
+            awk -F'\t' -v f="$1" -v k="$2" '$4 == f && $8 == k {print $1"\t"$5"\t"$6"\t"$7}' /tmp/latest-by-kind.tsv \
               | sort -t$'\t' -k1,1V | tail -1 || true
           }
 
           badge() {
             # $1 = label, $2 = family, $3 = color
             local line ver
-            line="$(latest_for "$2")"
+            line="$(latest_for "$2" plain)"
             ver="$(cut -f1 <<< "$line")"
             if [ -n "$ver" ]; then
               echo "[![${1}](https://img.shields.io/badge/${1// /_}-Go_${ver}-${3})](https://quay.io/repository/konveyor/builder?tab=tags)"
