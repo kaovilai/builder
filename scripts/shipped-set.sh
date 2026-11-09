@@ -86,7 +86,10 @@ for line in open(sys.argv[1]):
     last_modified[name] = when
 
 def family(n):
-    fips = "-fips" if "openssl-fips" in n else ""
+    # both fips generations — openssl-fips (Go ≤1.26) and hostfips
+    # (Go 1.27+) — are the same flavor lineage: 1.27.3 hostfips content
+    # is simply the newer fips image of the family
+    fips = "-fips" if ("openssl-fips" in n or "hostfips" in n) else ""
     m = re.match(r"^ubi(\d+)", n)
     return f"ubi{m.group(1) if m else '8'}{fips}"
 

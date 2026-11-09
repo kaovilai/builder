@@ -182,8 +182,10 @@ jobs:
               else
                 echo "[ubi${major}] rebuilds not published:${missing}; re-dispatching"
                 for tag in $missing; do
+                  # both fips generations' tag names (openssl-fips for
+                  # Go <=1.26, hostfips for 1.27+ — scripts/variant-prefix.sh)
                   case "$tag" in
-                    *openssl-fips*) flavor="fips" ;;
+                    *openssl-fips*|*hostfips*) flavor="fips" ;;
                     *) flavor="standard" ;;
                   esac
                   version=$(sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+)(-pre)?$/\1/' <<< "$tag")
@@ -246,7 +248,64 @@ jobs:
             # both would dispatch a duplicate build. The whole-line sort
             # keeps the explicit retry (an explicit version sorts before
             # LATEST), which pins exactly what the pending round wanted.
-            targets=$( { cat "$retry_targets"; echo "$selector_out"; } | sed '/^$/d' | sort -u -k1,2 -k4,4)
+            # every target is normalized to the name its rebuild will
+            # actually publish: selector and retry names reflect quay's
+            # current — possibly stale or pre-rename — state, while the
+            # build publishes per the naming contract (for fips targets
+            # the golang-fips source of the version picks the generation
+            # prefix and the tag kind, so a 1.27.3 rebuild publishes
+            # ubi9-hostfips-v1.27.3-pre even while a stale
+            # openssl-fips-named 1.27.3 tag is what selected it).
+            # A naming failure — the version's golang-fips release
+            # vanished upstream — isolates to its major: that major's
+            # rebuild round is skipped whole, its state left untouched
+            # for the next run to retry, so one missing release can
+            # neither strand a half-rebuilt family nor block the other
+            # majors.
+            normalize_one() { # $1 major, $2 flavor, $3 version, $4 tag → canonical line on stdout; non-zero on lookup failure
+              local major="$1" flavor="$2" version="$3" tag="$4" src_json src kind
+              if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                if [ "$flavor" = "fips" ]; then
+                  # assignment inside if: a failed lookup (after the
+                  # helper's own retries) must skip this target, not
+                  # abort the run
+                  if ! src_json="$(scripts/go-fips-releases.sh --best-for "$version")"; then
+                    echo "WARNING: golang-fips release lookup failed for ${version}; skipping ubi${major} rebuild round" >&2
+                    return 1
+                  fi
+                  src="$(jq -r '.tag' <<< "$src_json")"
+                  if [ -z "$src" ] || [ "$src" = "null" ]; then
+                    echo "WARNING: no golang-fips release matches ${version}; skipping ubi${major} rebuild round" >&2
+                    return 1
+                  fi
+                  if [ "$(jq -r '.pre' <<< "$src_json")" = "true" ]; then kind="-pre"; else kind=""; fi
+                  tag="$(scripts/variant-prefix.sh "$major" fips "$src")v${version}${kind}"
+                else
+                  tag="$(scripts/variant-prefix.sh "$major" standard "")v${version}"
+                fi
+              fi
+              printf '%s %s %s %s\n' "$major" "$flavor" "$version" "$tag"
+            }
+            : > /tmp/normalized-targets.txt
+            : > /tmp/norm-failed-majors.txt
+            while read -r major flavor version tag; do
+              [ -n "$major" ] || continue
+              # normalize before deduping: a retry line and a fresh
+              # selection of the same version can carry pre- and
+              # post-rename names, and deduping those separately would
+              # dispatch the build twice
+              normalize_one "$major" "$flavor" "$version" "$tag" >> /tmp/normalized-targets.txt \
+                || echo "$major" >> /tmp/norm-failed-majors.txt
+            done < <({ cat "$retry_targets"; echo "$selector_out"; } | sed '/^$/d')
+            if [ -s /tmp/norm-failed-majors.txt ]; then
+              failed_majors="$(sort -u /tmp/norm-failed-majors.txt | tr '\n' ' ')"
+              echo "target naming failed for major(s):${failed_majors}— rebuild round skipped, state unchanged"
+              targets=$(awk -v skip="$failed_majors" \
+                'BEGIN { n = split(skip, s, " "); for (i = 1; i <= n; i++) bad[s[i]] = 1 } !bad[$1]' \
+                /tmp/normalized-targets.txt | sort -u -k1,2 -k4,4)
+            else
+              targets=$(sort -u -k1,2 -k4,4 /tmp/normalized-targets.txt)
+            fi
             : > /tmp/dispatched.txt
             while read -r major flavor version tag; do
               [ -n "$major" ] || continue
@@ -273,7 +332,11 @@ jobs:
               # and latest<version> aliases)
               latest_json="[]"
               while read -r flavor; do
-                prefix="$(scripts/variant-prefix.sh "$major" "$flavor")"
+                # every prefix the flavor ships: standard has one, fips
+                # has one per generation (openssl-fips for Go <=1.26,
+                # hostfips for 1.27+) — aliases of both generations are
+                # canonical for their own content
+                while read -r prefix; do
                 # both alias kinds: plain latest backs stable content,
                 # latest-pre backs pre-release content
                 for alias in "${prefix}latest" "${prefix}latest-pre"; do
@@ -284,6 +347,10 @@ jobs:
                     *)     kind="" ;;
                   esac
                   matched=""
+                  # only targets published under this generation's
+                  # prefix can back this alias: an openssl-fips-named
+                  # alias must never be re-pointed at hostfips content
+                  # or vice versa
                   while read -r t; do
                     if [ "$(awk -v x="$t" '$1 == x {print $2; exit}' /tmp/tags.txt)" = "$lat_d" ]; then
                       latest_json=$(jq -c --arg a "$alias" --arg w "$lat_d" --arg o "$t" \
@@ -291,7 +358,7 @@ jobs:
                       matched=1
                       break
                     fi
-                  done < <(awk -v m="$major" -v f="$flavor" '$1 == m && $2 == f {print $3}' /tmp/dispatched.txt)
+                  done < <(awk -v m="$major" -v f="$flavor" -v re="^${prefix}" '$1 == m && $2 == f && $3 ~ re {print $3}' /tmp/dispatched.txt)
                   if [ -n "$matched" ]; then
                     continue
                   fi
@@ -305,7 +372,7 @@ jobs:
                   # finds no -pre target here, and grep's no-match exit
                   # would abort after dispatching but before the pending
                   # state is saved
-                  newest=$(awk -v m="$major" -v f="$flavor" '$1 == m && $2 == f {print $3}' /tmp/dispatched.txt \
+                  newest=$(awk -v m="$major" -v f="$flavor" -v re="^${prefix}" '$1 == m && $2 == f && $3 ~ re {print $3}' /tmp/dispatched.txt \
                     | awk -v k="$kind" '$0 ~ ("v[0-9.]+" k "$")' | sort -V | tail -1)
                   [ -n "$newest" ] || continue
                   newest_v=$(sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/' <<< "$newest")
@@ -322,6 +389,7 @@ jobs:
                       '. + [{alias: $a, was: $w, of: $o}]' <<< "$latest_json")
                   fi
                 done
+                done < <(scripts/variant-prefix.sh --all "$major" "$flavor")
               done < <(awk -v m="$major" '$1 == m {print $2}' /tmp/dispatched.txt | sort -u)
               now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
               # union with the existing pending.latest by alias, keeping
@@ -334,8 +402,38 @@ jobs:
               # all, so dropping the saved one would strand it on the
               # stale base forever. Equal versions keep the fresh
               # mapping: its `was` reflects the alias digest now.
-              merged_latest=$(jq -c --arg m "$major" --argjson lt "$latest_json" '
-                [ ((.[$m].pending.latest // [])[] | {mapping: ., fresh: 0}),
+              # A saved mapping is dropped when its target was RENAMED
+              # by normalization (same version now dispatched under a
+              # different name — a pre-rename openssl-fips-named target
+              # of a hostfips version): that name will never publish
+              # again, so keeping the mapping would wedge the
+              # confirmation forever, and its wrong-generation alias is
+              # the build's manual-prune business, not a re-point.
+              # Mappings of targets not dispatched this round at all
+              # (already published, or another family's) survive.
+              # the saved and fresh arrays are built independently
+              # before combining: the fresh element must not sit inside
+              # the pipeline fed by the saved iteration, or an empty
+              # saved list (a fresh drift round) would discard every
+              # fresh repair. Rename detection matches the saved
+              # target's FLAVOR, not the version alone: a standard
+              # ubi9-v1.26.10 retry target must not read as a rename of
+              # a saved fips repair of the same version.
+              merged_latest=$(jq -c --arg m "$major" --argjson lt "$latest_json" --argjson tg "$targets_json" '
+                def flavor(t): if (t | test("openssl-fips|hostfips")) then "fips" else "standard" end;
+                # `. as $saved` (not `[] as $saved`): an as-binding
+                # over the iteration keeps the input at each mapping, so
+                # the array below collects the mappings themselves —
+                # `[] as $saved` would leave the input at the root state
+                # and wrap whole-state objects as mappings
+                [ ([ (.[$m].pending.latest // [])[]
+                    | . as $saved
+                    | ($saved.of | capture("v(?<v>[0-9]+\\.[0-9]+\\.[0-9]+)").v) as $ver
+                    | select(
+                        ($tg | index($saved.of))
+                        or (($tg | map(select(flavor(.) == flavor($saved.of)))
+                            | map(capture("v(?<v>[0-9]+\\.[0-9]+\\.[0-9]+)").v)) | index($ver) | not))
+                    ] | .[] | {mapping: ., fresh: 0}),
                   ($lt[] | {mapping: ., fresh: 1}) ]
                 | group_by(.mapping.alias)
                 | map(max_by([ (.mapping.of

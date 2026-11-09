@@ -181,17 +181,22 @@ jobs:
         run: |
           # record the exact go-fips source tag for the image label below
           # — badges and releases read it back to classify the built image
-          # by what it was actually built from rather than by push timing
+          # by what it was actually built from rather than by push timing.
+          # $GITHUB_ENV only reaches later steps, so the prefix below
+          # reads the same value from the input variable directly
           if [ "$FLAVOR_INPUT" = "fips" ]; then
-            echo "FIPS_SOURCE_TAG=${BUILD_ARG_INPUT#FIPS_TAG=}" >> $GITHUB_ENV
+            src="${BUILD_ARG_INPUT#FIPS_TAG=}"
           else
-            echo "FIPS_SOURCE_TAG=" >> $GITHUB_ENV
+            src=""
           fi
+          echo "FIPS_SOURCE_TAG=$src" >> $GITHUB_ENV
           platform=${{ matrix.platform }}
           # computed before the echo: a failed helper inside $( ) would
           # otherwise be masked by echo's success and publish under an
-          # empty prefix
-          prefix="$(scripts/variant-prefix.sh "$UBI" "$FLAVOR")"
+          # empty prefix. The fips source tag picks the generation
+          # prefix (openssl-fips vs hostfips), so the tag name states
+          # the backend the image actually uses
+          prefix="$(scripts/variant-prefix.sh "$UBI" "$FLAVOR" "$src")"
           {
             echo "PLATFORM_PAIR=${platform//\//-}"
             echo "VERSION_SAFE=$VERSION_SAFE_INPUT"
@@ -419,8 +424,17 @@ jobs:
           else
             echo "TAG_KIND=" >> $GITHUB_ENV
           fi
-          prefix="$(scripts/variant-prefix.sh "$UBI" "$FLAVOR")"
+          # version_safe carries the fips source tag for fips builds
+          # (go<version>-<build>-(openssl-fips|hostfips-release)), which
+          # picks the generation prefix; standard builds ignore it
+          prefix="$(scripts/variant-prefix.sh "$UBI" "$FLAVOR" "$VERSION_SAFE_INPUT")"
           echo "PREFIX=$prefix" >> $GITHUB_ENV
+          if [ "$FLAVOR" = "fips" ]; then
+            sibling="$(scripts/variant-prefix.sh --sibling "$UBI" "$FLAVOR" "$VERSION_SAFE_INPUT")"
+            echo "SIBLING_PREFIX=$sibling" >> $GITHUB_ENV
+          else
+            echo "SIBLING_PREFIX=" >> $GITHUB_ENV
+          fi
 
       - name: download digests...
         uses: actions/download-artifact@v8
@@ -505,7 +519,10 @@ jobs:
         env:
           # matrix fields reach scripts via env, never shell interpolation
           TAG_SUFFIX: ${{ matrix.tag_suffix }}
+          # for scripts/go-fips-releases.sh (public golang-fips reads)
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           # Keep quay honest about pre-release content: a pre-release
           # build publishes only -pre tags and a stable build only plain
           # tags, so the opposite-kind PATCH tag for this version must
@@ -525,10 +542,124 @@ jobs:
           # the newest stable build, -pre ones at the newest pre-release
           # build — so deleting the opposite kind there could remove a
           # valid stable alias.
+          #
+          # A Go version ships exactly one FIPS backend, so any tag of
+          # this version under the sibling generation's prefix is
+          # wrong-name content (e.g. the openssl-fips-named 1.27.3 tags
+          # published before the prefixes split). Those tags are pruned
+          # manually per the comment above; what the build CAN do with
+          # robot credentials is push, so it re-points the sibling
+          # canonical latest aliases back to the newest remaining
+          # content of their own generation (never this build's version
+          # — it just left that generation) and logs the exact tags the
+          # manual prune should remove.
+          if [ -n "$SIBLING_PREFIX" ]; then
+            echo "manual prune needed (wrong-generation tags of ${{ env.patch_version }}):"
+            for t in "v${{ env.patch_version }}" "v${{ env.patch_version }}-pre" \
+                     "v${{ env.minor_version }}" "v${{ env.minor_version }}-pre" \
+                     "latest${{ env.patch_version }}" "latest${{ env.patch_version }}-pre"; do
+              echo "  ${SIBLING_PREFIX}${t}"
+            done
+            # re-point a canonical alias only when it still serves the
+            # digest the tag snapshot recorded: a concurrent build can
+            # have promoted it since (push and dispatch builds share no
+            # concurrency group), and re-pointing from a stale snapshot
+            # would roll that promotion back. Same compare-and-swap the
+            # drift check's confirmation uses; the residual inspect-to-
+            # create window is seconds and self-heals on the next
+            # refresh round.
+            refresh_alias() { # $1 alias, $2 keep tag, $3 snapshot digest ("" when absent then)
+              local now_d
+              now_d=$(docker buildx imagetools inspect "quay.io/konveyor/builder:$1" \
+                --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+              if [ "$now_d" != "$3" ]; then
+                echo "skipped $1 refresh: alias moved since the tag snapshot (concurrent promotion?); the next round re-evaluates"
+                return 0
+              fi
+              docker buildx imagetools create \
+                -t "quay.io/konveyor/builder:$1" \
+                "quay.io/konveyor/builder:$2"
+              echo "re-pointed $1 -> $2"
+            }
+            # the sibling generation's backend, for validating candidates
+            case "$SIBLING_PREFIX" in
+              *hostfips*)     sib_backend="-hostfips-release" ;;
+              *openssl-fips*) sib_backend="-openssl-fips" ;;
+            esac
+            # every active tag (paginated, like every other consumer)
+            # and the golang-fips release list, both through the shared
+            # single owners
+            scripts/shipped-set.sh --raw > /tmp/all-active-tags.txt
+            scripts/go-fips-releases.sh > /tmp/fips-releases.json
+            for kind in "" "-pre"; do
+              alias="${SIBLING_PREFIX}latest${kind}"
+              keep=$(jq -rRn --arg p "${SIBLING_PREFIX}v" --arg k "$kind" \
+                  --arg own "${{ env.patch_version }}" --arg sib "$sib_backend" \
+                  --slurpfile r /tmp/fips-releases.json \
+                  '[inputs | split(" ") | .[0]]
+                   | .[]
+                   | select(startswith($p) and endswith($k))
+                   # rtrimstr("") would destroy the string, so the plain
+                   # kind strips no suffix
+                   | (ltrimstr($p) | if $k == "" then . else rtrimstr($k) end) as $v
+                   | select($v | test("^[0-9]+\\.[0-9]+\\.[0-9]+$") and $v != $own)
+                   # a candidate only counts when its version actually
+                   # ships the sibling generation: the old namespace
+                   # holds wrong-name hostfips content for migrating
+                   # versions (an openssl-named 1.27.2 must not back
+                   # openssl-fips-latest)
+                   | select([$r[0][] | select((.tag | split("-")[0] | ltrimstr("go")) == $v)]
+                            | .[0].tag // "" | endswith($sib))
+                   | "\($v) \(.)"
+                   ' < /tmp/all-active-tags.txt \
+                | sort -V | tail -1 | cut -d" " -f2)
+              if [ -n "$keep" ]; then
+                was_d=$(awk -v t="$alias" '$1 == t {print $2; exit}' /tmp/all-active-tags.txt)
+                refresh_alias "$alias" "$keep" "$was_d"
+              else
+                echo "  ${alias} (no ${kind:-plain} content of its generation left; prune manually)"
+              fi
+            done
+          fi
           docker buildx imagetools create \
             -t quay.io/konveyor/builder:${PREFIX}v${{ env.minor_version }}${TAG_KIND} \
             -t quay.io/konveyor/builder:${PREFIX}v${{ env.patch_version }}${TAG_KIND} \
             $(printf 'quay.io/konveyor/builder@sha256:%s ' $(ls /tmp/digests))
+
+          # the current generation's canonical alias for this build's
+          # kind must serve its newest eligible content — which can be
+          # this build: an explicit-version publish moves only the
+          # versioned and latest<version> aliases, and no LATEST build
+          # of an older generation ever runs to advance the canonical
+          # alias (the newest minor is the other generation's), so a
+          # 1.26.11 release would leave openssl-fips-latest on 1.26.10
+          # until a drift round noticed. Same eligibility rule as the
+          # sibling aliases above; this build's own version competes.
+          if [ -n "$SIBLING_PREFIX" ]; then
+            case "$PREFIX" in
+              *hostfips*)     own_backend="-hostfips-release" ;;
+              *openssl-fips*) own_backend="-openssl-fips" ;;
+            esac
+            best=$(jq -rRn --arg p "${PREFIX}v" --arg k "$TAG_KIND" --arg own "$own_backend" \
+                --slurpfile r /tmp/fips-releases.json \
+                '[inputs | split(" ") | .[0]]
+                 | .[]
+                 | select(startswith($p) and endswith($k))
+                 | (ltrimstr($p) | if $k == "" then . else rtrimstr($k) end) as $v
+                 | select($v | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                 | select([$r[0][] | select((.tag | split("-")[0] | ltrimstr("go")) == $v)]
+                          | .[0].tag // "" | endswith($own))
+                 | "\($v) \(.)"
+                 ' < /tmp/all-active-tags.txt \
+              | sort -V | tail -1)
+            best_ver="${best%% *}"
+            if [ -z "$best" ] \
+               || [ "$(printf '%s\n%s\n' "$best_ver" "${{ env.patch_version }}" | sort -V | tail -1)" = "${{ env.patch_version }}" ]; then
+              best="${{ env.patch_version }} ${PREFIX}v${{ env.patch_version }}${TAG_KIND}"
+            fi
+            was_d=$(awk -v t="${PREFIX}latest${TAG_KIND}" '$1 == t {print $2; exit}' /tmp/all-active-tags.txt)
+            refresh_alias "${PREFIX}latest${TAG_KIND}" "${best#* }" "$was_d"
+          fi
 
       - name: verify the published artifact...
         # Pull the artifact back the way a consumer would: e2e validated a

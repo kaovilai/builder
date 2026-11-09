@@ -68,9 +68,11 @@ jobs:
           # follow the published scheme (ubi8 unprefixed, ubi9/ubi10 prefixed).
           variants=$(grep -vE '^[[:space:]]*(#|$)' variants.txt | sort -n)
 
-          # the tag-naming contract is owned by scripts/variant-prefix.sh
-          variant_prefix() { # $1 = ubi major, $2 = flavor
-            scripts/variant-prefix.sh "$1" "$2"
+          # the tag-naming contract is owned by scripts/variant-prefix.sh;
+          # the fips source tag picks the generation prefix (openssl-fips
+          # vs hostfips), so a tag name states the backend it ships
+          variant_prefix() { # $1 = ubi major, $2 = flavor, $3 = fips source tag ("" for standard)
+            scripts/variant-prefix.sh "$1" "$2" "$3"
           }
 
           # Collect all active tags published to quay.io/konveyor/builder.
@@ -117,7 +119,7 @@ jobs:
             if [ "$idx" -eq 0 ]; then input=""; else input="$ver"; fi
             while read -r ubi flavor; do
               [ "$flavor" = "standard" ] || continue
-              expected="$(variant_prefix "$ubi" "$flavor")v${ver}"
+              expected="$(variant_prefix "$ubi" "$flavor" "")v${ver}"
               if tag_published "$expected"; then
                 echo "[ubi${ubi}] $expected already published, skipping"
               else
@@ -148,14 +150,16 @@ jobs:
           # skip the week's FIPS updates.
           fips_top2="$(scripts/go-fips-releases.sh --top2)"
           mapfile -t FIPS_ENTRIES < <(jq -r '
-            to_entries[] | "\(.key) \(.value.pre) \(.value.version)"
+            to_entries[] | "\(.key) \(.value.pre) \(.value.version) \(.value.tag)"
           ' <<< "$fips_top2")
 
           for entry in "${FIPS_ENTRIES[@]}"; do
             idx="${entry%% *}"
             rest="${entry#* }"
             pre="${rest%% *}"
-            ver="${rest#* }"
+            rest2="${rest#* }"
+            ver="${rest2%% *}"
+            src="${rest2#* }"
             if [ "$idx" -eq 0 ]; then input=""; else input="$ver"; fi
             # the expected tag carries the source's kind: pre-release
             # sources publish only -pre tags, and a source that went
@@ -163,7 +167,7 @@ jobs:
             if [ "$pre" = "true" ]; then kind="-pre"; else kind=""; fi
             while read -r ubi flavor; do
               [ "$flavor" = "fips" ] || continue
-              expected="$(variant_prefix "$ubi" "$flavor")v${ver}${kind}"
+              expected="$(variant_prefix "$ubi" "$flavor" "$src")v${ver}${kind}"
               if tag_published "$expected"; then
                 echo "[ubi${ubi}-fips] $expected already published, skipping"
               else
