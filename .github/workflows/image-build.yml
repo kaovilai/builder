@@ -505,40 +505,26 @@ jobs:
         env:
           # matrix fields reach scripts via env, never shell interpolation
           TAG_SUFFIX: ${{ matrix.tag_suffix }}
-          QUAY_ROBOT: ${{ secrets.QUAY_PUBLISH_ROBOT }}
-          QUAY_TOKEN_API: ${{ secrets.QUAY_PUBLISH_TOKEN }}
         run: |
           # Keep quay honest about pre-release content: a pre-release
           # build publishes only -pre tags and a stable build only plain
-          # tags, and each prunes the opposite-kind PATCH tag for this
-          # version so the two can never advertise the same content.
-          # Only the patch tag is pruned: the moving aliases (v<minor>,
-          # latest[-<version>]) legitimately serve different content per
-          # kind — plain ones keep pointing at the newest stable build,
-          # -pre ones at the newest pre-release build — so deleting the
-          # opposite kind there could remove a valid stable alias.
-          prune_opposite_kind() { # $1 = tag name of the opposite kind
-            local code
-            code=$(curl -sS -o /dev/null -w '%{http_code}' \
-              -u "${QUAY_ROBOT}:${QUAY_TOKEN_API}" \
-              -X DELETE "https://quay.io/api/v1/repository/konveyor/builder/tag/$1")
-            case "$code" in
-              200|204) echo "removed stale tag $1" ;;
-              404) ;; # never existed
-              *)
-                # an unverified cleanup would leave both kinds advertising
-                # the same content — refuse to publish
-                echo "ERROR: removing $1 returned HTTP ${code}"
-                exit 1
-                ;;
-            esac
-          }
-          if [ "$TAG_KIND" = "-pre" ]; then
-            opposite=""
-          else
-            opposite="-pre"
-          fi
-          prune_opposite_kind "${PREFIX}v${{ env.patch_version }}${opposite}"
+          # tags, so the opposite-kind PATCH tag for this version must
+          # not survive a publish. That pruning is NOT automated here:
+          # tag deletion goes through quay's management API, which
+          # rejects robot-account credentials (403 "CSRF token was
+          # invalid or missing" — robots authenticate the Docker v2
+          # registry API only, the same pair that pushes these images),
+          # and no non-robot OAuth token is used in this workflow.
+          # Pruning is done manually with a personal/org OAuth access
+          # token (repo:write, quay.io -> <org> -> Applications):
+          #   curl -H "Authorization: Bearer <token>" -X DELETE \
+          #     https://quay.io/api/v1/repository/konveyor/builder/tag/<tag>
+          # Only the opposite-kind PATCH tag is ever pruned: the moving
+          # aliases (v<minor>, latest[-<version>]) legitimately serve
+          # different content per kind — plain ones keep pointing at
+          # the newest stable build, -pre ones at the newest pre-release
+          # build — so deleting the opposite kind there could remove a
+          # valid stable alias.
           docker buildx imagetools create \
             -t quay.io/konveyor/builder:${PREFIX}v${{ env.minor_version }}${TAG_KIND} \
             -t quay.io/konveyor/builder:${PREFIX}v${{ env.patch_version }}${TAG_KIND} \
