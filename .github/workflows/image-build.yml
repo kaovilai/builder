@@ -429,7 +429,8 @@ jobs:
           echo "PRE_SOURCE=${PRE_SOURCE_INPUT:-false}" >> $GITHUB_ENV
           # a pre-release-sourced build publishes ONLY -pre tags: plain
           # tags must not exist for pre-release content at all
-          if [ "$PRE_SOURCE" = "true" ]; then
+          # ($GITHUB_ENV only reaches later steps — read the input here)
+          if [ "${PRE_SOURCE_INPUT:-false}" = "true" ]; then
             echo "TAG_KIND=-pre" >> $GITHUB_ENV
           else
             echo "TAG_KIND=" >> $GITHUB_ENV
@@ -530,30 +531,35 @@ jobs:
         run: |
           # Keep quay honest about pre-release content: a pre-release
           # build publishes only -pre tags and a stable build only plain
-          # tags, and each prunes the opposite kind for this version so
-          # the two can never advertise the same content.
-          prune_opposite_kind() { # $@ = tag names of the opposite kind
-            local tag code
-            for tag in "$@"; do
-              code=$(curl -sS -o /dev/null -w '%{http_code}' \
-                -u "${QUAY_ROBOT}:${QUAY_TOKEN_API}" \
-                -X DELETE "https://quay.io/api/v1/repository/konveyor/builder/tag/${tag}")
-              case "$code" in
-                200|204) echo "removed stale tag ${tag}" ;;
-                404) ;; # never existed
-                *) echo "WARNING: removing ${tag} returned HTTP ${code}" ;;
-              esac
-            done
+          # tags, and each prunes the opposite-kind PATCH tag for this
+          # version so the two can never advertise the same content.
+          # Only the patch tag is pruned: the moving aliases (v<minor>,
+          # latest[-<version>]) legitimately serve different content per
+          # kind — plain ones keep pointing at the newest stable build,
+          # -pre ones at the newest pre-release build — so deleting the
+          # opposite kind there could remove a valid stable alias.
+          prune_opposite_kind() { # $1 = tag name of the opposite kind
+            local code
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -u "${QUAY_ROBOT}:${QUAY_TOKEN_API}" \
+              -X DELETE "https://quay.io/api/v1/repository/konveyor/builder/tag/$1")
+            case "$code" in
+              200|204) echo "removed stale tag $1" ;;
+              404) ;; # never existed
+              *)
+                # an unverified cleanup would leave both kinds advertising
+                # the same content — refuse to publish
+                echo "ERROR: removing $1 returned HTTP ${code}"
+                exit 1
+                ;;
+            esac
           }
           if [ "$TAG_KIND" = "-pre" ]; then
             opposite=""
           else
             opposite="-pre"
           fi
-          prune_opposite_kind \
-            "${PREFIX}latest${TAG_SUFFIX}${opposite}" \
-            "${PREFIX}v${{ env.minor_version }}${opposite}" \
-            "${PREFIX}v${{ env.patch_version }}${opposite}"
+          prune_opposite_kind "${PREFIX}v${{ env.patch_version }}${opposite}"
           docker buildx imagetools create \
             -t quay.io/konveyor/builder:${PREFIX}v${{ env.minor_version }}${TAG_KIND} \
             -t quay.io/konveyor/builder:${PREFIX}v${{ env.patch_version }}${TAG_KIND} \
@@ -569,8 +575,10 @@ jobs:
         run: |
           set -euo pipefail
           img=quay.io/konveyor/builder
-          patch_tag="${PREFIX}v${patch_version}"
-          minor_tag="${PREFIX}v${minor_version}"
+          # the kind this build published (plain or -pre) — every
+          # inspection below must use it
+          patch_tag="${PREFIX}v${patch_version}${TAG_KIND}"
+          minor_tag="${PREFIX}v${minor_version}${TAG_KIND}"
 
           manifest_digest=$(docker buildx imagetools inspect "${img}:${patch_tag}" --format '{{.Manifest.Digest}}')
           platforms=$(docker buildx imagetools inspect "${img}:${patch_tag}" \
@@ -580,8 +588,6 @@ jobs:
               || { echo "ERROR: $p missing from ${img}:${patch_tag} (platforms: $platforms)"; exit 1; }
           done
 
-          minor_tag="${minor_tag}${TAG_KIND}"
-          patch_tag="${patch_tag}${TAG_KIND}"
           tags_to_check=("$minor_tag" "$patch_tag")
           for tag in "${tags_to_check[@]}"; do
             d=$(docker buildx imagetools inspect "${img}:${tag}" --format '{{.Manifest.Digest}}')

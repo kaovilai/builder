@@ -123,6 +123,16 @@ jobs:
               missing=""
               for tag in $targets; do
                 lm=$(awk -v t="$tag" '$1 == t { $1 = ""; $2 = ""; sub(/^ +/, ""); print; exit }' /tmp/tags.txt)
+                if [ -z "$lm" ]; then
+                  # graduation replaces a -pre target with its plain
+                  # counterpart (and vice versa): a counterpart published
+                  # after the dispatch counts as the target landing
+                  case "$tag" in
+                    *-pre) counterpart="${tag%-pre}" ;;
+                    *)     counterpart="${tag}-pre" ;;
+                  esac
+                  lm=$(awk -v t="$counterpart" '$1 == t { $1 = ""; $2 = ""; sub(/^ +/, ""); print; exit }' /tmp/tags.txt)
+                fi
                 if [ -z "$lm" ] || [ "$(date -d "$pat" +%s)" -ge "$(date -d "$lm" +%s)" ]; then
                   missing="$missing $tag"
                 fi
