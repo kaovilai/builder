@@ -51,7 +51,7 @@ jobs:
             while :; do
               resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
                 "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
-              echo "$resp" | jq -r '.tags[] | "\(.name) \(.last_modified)"' 
+              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest) \(.last_modified)"' 
               [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
               page=$((page + 1))
             done
@@ -135,9 +135,9 @@ jobs:
           # Latest published Go version per image variant. Empty when the variant
           # has no matching tag yet — grep exits 1 on no match, so the pipeline
           # needs `|| true` to keep set -e/pipefail from aborting the run.
-          latest_for() { # $1 = published-tag regex → "<version> <last_modified>" of the newest match
+          latest_for() { # $1 = published-tag regex → "<version> <digest> <last_modified>" of the newest match
             grep -E "$1" <<< "$PUBLISHED_TAGS" \
-              | sed -E 's/^.*v([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]+(.*)$/\1 \2/' | sort -V | tail -1 || true
+              | sed -E 's/^.*v([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]+(sha256:[a-f0-9]+)[[:space:]]+(.*)$/\1 \2 \3/' | sort -V | tail -1 || true
           }
 
           badge() {
@@ -156,12 +156,14 @@ jobs:
           # as "--")
           fips_badge() {
             # $1 = label, $2 = published-tag regex
-            local line ver ts suffix color
+            local line ver rest digest ts suffix color
             line="$(latest_for "$2")"
             ver="${line%% *}"
-            ts="${line#* }"
+            rest="${line#* }"
+            digest="${rest%% *}"
+            ts="${rest#* }"
             if [ -n "$ver" ]; then
-              case "$(fips_pre "$ver" "$ts")" in
+              case "$(fips_pre "$ver" "$ts" "$digest")" in
                 true)    suffix="_pre--release"; color=orange ;;
                 false)   suffix=""; color=blueviolet ;;
                 *)
