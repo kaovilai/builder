@@ -45,18 +45,10 @@ jobs:
           # tag list instead of failing the run.
           shopt -s inherit_errexit
 
-          # Collect all active tags published to quay.io/konveyor/builder.
-          published_tags() {
-            local page=1 resp
-            while :; do
-              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
-                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
-              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest) \(.last_modified)"' 
-              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
-              page=$((page + 1))
-            done
-          }
-          PUBLISHED_TAGS="$(published_tags)"
+          # Shipped set: the shared selector (scripts/shipped-set.sh) —
+          # one row per shipped image:
+          # version major flavor family digest tag last_modified newest
+          scripts/shipped-set.sh > /tmp/shipped.tsv
 
           # golang-fips source releases (same candidate filter as
           # image-build.yml's FIPS selection), so FIPS badges can say
@@ -133,18 +125,19 @@ jobs:
           }
 
           # Latest published Go version per image variant. Empty when the variant
-          # has no matching tag yet — grep exits 1 on no match, so the pipeline
-          # needs `|| true` to keep set -e/pipefail from aborting the run.
-          latest_for() { # $1 = published-tag regex → "<version>[-pre] <digest> <last_modified>" of the newest match
-            grep -E "$1" <<< "$PUBLISHED_TAGS" \
-              | sed -E 's/^.*v([0-9]+\.[0-9]+\.[0-9]+)(-pre)?[[:space:]]+(sha256:[a-f0-9]+)[[:space:]]+(.*)$/\1\2 \3 \4/' | sort -V | tail -1 || true
+          # Newest shipped row of a variant family — empty when the
+          # family has no shipped image yet (awk prints nothing and the
+          # pipeline needs `|| true` to keep set -e from aborting).
+          latest_for() { # $1 = family → "<version>\t<digest>\t<tag>\t<last_modified>" of the newest row
+            awk -F'\t' -v f="$1" '$4 == f {print $1"\t"$5"\t"$6"\t"$7}' /tmp/shipped.tsv \
+              | sort -t$'\t' -k1,1V | tail -1 || true
           }
 
           badge() {
-            # $1 = label, $2 = published-tag regex, $3 = color
+            # $1 = label, $2 = family, $3 = color
             local line ver
             line="$(latest_for "$2")"
-            ver="${line%% *}"
+            ver="$(cut -f1 <<< "$line")"
             if [ -n "$ver" ]; then
               echo "[![${1}](https://img.shields.io/badge/${1// /_}-Go_${ver}-${3})](https://quay.io/repository/konveyor/builder?tab=tags)"
             fi
@@ -155,15 +148,12 @@ jobs:
           # source is a pre-release tag (shields escapes a literal dash
           # as "--")
           fips_badge() {
-            # $1 = label, $2 = published-tag regex
-            local line ver rest digest ts suffix color
+            # $1 = label, $2 = family
+            local line ver digest tag ts suffix color
             line="$(latest_for "$2")"
-            ver="${line%% *}"
-            rest="${line#* }"
-            digest="${rest%% *}"
-            ts="${rest#* }"
+            IFS=$'\t' read -r ver digest tag ts <<< "$line"
             if [ -n "$ver" ]; then
-              case "$ver" in
+              case "$tag" in
                 # pre-release content publishes only -pre tags — the
                 # suffix is the classification
                 *-pre)
@@ -205,11 +195,9 @@ jobs:
             # ubi8 publishes unprefixed tags; ubi9/ubi10 are prefixed.
             while read -r major flavor; do
               if [ "$flavor" = "fips" ]; then
-                if [ "$major" = "8" ]; then rx='^openssl-fips-v'; else rx="^ubi${major}-openssl-fips-v"; fi
-                fips_badge "UBI ${major} FIPS" "${rx}[0-9]+\.[0-9]+\.[0-9]+(-pre)?[[:space:]]"
+                fips_badge "UBI ${major} FIPS" "ubi${major}-fips"
               else
-                if [ "$major" = "8" ]; then rx='^v'; else rx="^ubi${major}-v"; fi
-                badge "UBI ${major}" "${rx}[0-9]+\.[0-9]+\.[0-9]+[[:space:]]" blue
+                badge "UBI ${major}" "ubi${major}" blue
               fi
             done < <(grep -vE '^[[:space:]]*(#|$)' variants.txt | sort -n)
           } > /tmp/badges.md

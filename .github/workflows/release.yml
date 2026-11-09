@@ -48,71 +48,10 @@ jobs:
           set -euo pipefail
           shopt -s inherit_errexit
 
-          published_tags() {
-            local page=1 resp
-            while :; do
-              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
-                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
-              # godev filtered in jq: a page holding only godev tags would
-              # make grep exit 1 and abort the run
-              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | "\(.name) \(.manifest_digest) \(.last_modified)"'
-              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
-              page=$((page + 1))
-            done
-          }
-
-          # Shipped set: tags grouped by manifest digest, per variant family
-          # the newest patch of each of the two newest minor versions.
-          published_tags > /tmp/tags.txt
-          python3 - /tmp/tags.txt > /tmp/shipped.tsv <<'PYEOF'
-          import re
-          import sys
-          from collections import defaultdict
-
-          by_digest = {}
-          last_modified = {}
-          for line in open(sys.argv[1]):
-              name, digest, when = line.split(None, 2)
-              when = when.strip()
-              by_digest.setdefault(digest, []).append(name)
-              last_modified[name] = when
-
-          def family(n):
-              fips = "-fips" if "openssl-fips" in n else ""
-              m = re.match(r"^ubi(\d+)", n)
-              return f"ubi{m.group(1) if m else '8'}{fips}"
-
-          fams = defaultdict(list)
-          for digest, names in by_digest.items():
-              versions = set()
-              for n in names:
-                  # anchored with an optional -pre suffix: pre-release
-                  # content publishes only -pre tags, stable only plain
-                  m = re.search(r"v(\d+)\.(\d+)\.(\d+)(-pre)?$", n)
-                  if m:
-                      versions.add((int(m[1]), int(m[2]), int(m[3])))
-              fams[family(names[0])].append({"digest": digest, "tags": names, "versions": versions})
-
-          # release version -> list of (family, digest, version, tag)
-          releases = defaultdict(list)
-          for key, entries in fams.items():
-              minors = sorted({v[:2] for e in entries for v in e["versions"]}, reverse=True)[:2]
-              for minor in minors:
-                  best = None
-                  for e in entries:
-                      for v in e["versions"]:
-                          if v[:2] == minor and (best is None or v > best[0]):
-                              best = (v, e)
-                  if best:
-                      v, e = best
-                      suffix = "v%d.%d.%d" % v
-                      tag = next(n for n in e["tags"] if n.endswith(suffix) or n.endswith(suffix + "-pre"))
-                      releases["%d.%d.%d" % v].append((key, e["digest"], v, tag))
-
-          for version in sorted(releases):
-              for family, digest, v, tag in sorted(releases[version]):
-                  print("%s\t%s\t%s\t%s\t%s" % (version, family, digest, tag, last_modified[tag]))
-          PYEOF
+          # Shipped set: the shared selector (scripts/shipped-set.sh), remapped
+          # to version/family/digest/tag/last_modified.
+          scripts/shipped-set.sh \
+            | awk -F'\t' '{print $1"\t"$4"\t"$5"\t"$6"\t"$7}' > /tmp/shipped.tsv
 
           # golang-fips source releases (same candidate filter and ordering
           # as image-build.yml's FIPS selection): a FIPS family's images are

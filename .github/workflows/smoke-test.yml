@@ -36,69 +36,24 @@ jobs:
           set -euo pipefail
           shopt -s inherit_errexit
 
-          published_tags() {
-            local page=1 resp
-            while :; do
-              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
-                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
-              # godev filtered in jq: a page holding only godev tags would
-              # make grep exit 1 and abort the run
-              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | "\(.name) \(.manifest_digest)"'
-              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
-              page=$((page + 1))
-            done
-          }
-
-          published_tags > /tmp/tags.txt
-          matrix=$(python3 - /tmp/tags.txt <<'PYEOF'
+          # Shipped set: the shared selector (scripts/shipped-set.sh).
+          scripts/shipped-set.sh > /tmp/shipped.tsv
+          matrix=$(python3 - /tmp/shipped.tsv <<'PYEOF'
           import json
-          import re
           import sys
-          from collections import defaultdict
-
-          by_digest = {}
-          for line in open(sys.argv[1]):
-              name, digest = line.split()
-              by_digest.setdefault(digest, []).append(name)
-
-          def family(n):
-              fips = "-fips" if "openssl-fips" in n else ""
-              m = re.match(r"^ubi(\d+)", n)
-              return f"ubi{m.group(1) if m else '8'}{fips}"
-
-          fams = defaultdict(list)
-          for digest, names in by_digest.items():
-              versions = set()
-              for n in names:
-                  # anchored with an optional -pre suffix: pre-release
-                  # content publishes only -pre tags, stable only plain
-                  m = re.search(r"v(\d+)\.(\d+)\.(\d+)(-pre)?$", n)
-                  if m:
-                      versions.add((int(m[1]), int(m[2]), int(m[3])))
-              fams[family(names[0])].append({"digest": digest, "tags": names, "versions": versions})
-
+          
           include = []
-          for key, entries in fams.items():
-              minors = sorted({v[:2] for e in entries for v in e["versions"]}, reverse=True)[:2]
-              for minor in minors:
-                  best = None
-                  for e in entries:
-                      for v in e["versions"]:
-                          if v[:2] == minor and (best is None or v > best[0]):
-                              best = (v, e)
-                  if best:
-                      v, e = best
-                      suffix = "v%d.%d.%d" % v
-                      tag = next(n for n in e["tags"] if n.endswith(suffix) or n.endswith(suffix + "-pre"))
-                      version = "%d.%d.%d" % v
-                      include.append({
-                          "image": f"quay.io/konveyor/builder:{tag}",
-                          "version": version,
-                          "fips": key.endswith("-fips"),
-                          # deep FIPS probe applies to the native crypto/fips140
-                          # module (Go 1.27+); older openssl-fips ignores it
-                          "fips_probe": key.endswith("-fips") and (v[0], v[1]) >= (1, 27),
-                      })
+          for line in open(sys.argv[1]):
+              version, major, flavor, family, digest, tag, lm, newest = line.rstrip("\n").split("\t")
+              include.append({
+                  "image": f"quay.io/konveyor/builder:{tag}",
+                  "version": version,
+                  "fips": flavor == "fips",
+                  # deep FIPS probe applies to the native crypto/fips140 module
+                  # (Go 1.27+); older openssl-fips ignores it
+                  "fips_probe": flavor == "fips"
+                      and tuple(int(x) for x in version.split(".")[:2]) >= (1, 27),
+              })
           print(json.dumps({"include": sorted(include, key=lambda x: x["image"])}))
           PYEOF
           )

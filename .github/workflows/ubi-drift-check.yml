@@ -94,19 +94,10 @@ jobs:
           state=$(cat "$state_file")
           pending_majors=$(jq -r '[to_entries[] | select(.value.pending) | .key] | join(" ")' <<< "$state")
 
-          # Active tags with manifest digest and last-modified timestamp.
-          published_tags() {
-            local page=1 resp
-            while :; do
-              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
-                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
-              # godev filtered in jq: a page holding only godev tags would
-              # make grep exit 1 and abort the run
-              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | "\(.name) \(.manifest_digest) \(.last_modified)"'
-              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
-              page=$((page + 1))
-            done
-          }
+          # Active tags with manifest digest and last-modified timestamp:
+          # the shared selector's raw mode (tags outside the shipped set
+          # included — the publish confirmation looks up tags that may
+          # have graduated or moved on).
           retry_targets=/tmp/retry-targets.txt
           : > "$retry_targets"
           if [ -n "$pending_majors" ]; then
@@ -115,7 +106,7 @@ jobs:
             # republished after the dispatch, so a failed rebuild of one
             # flavor or version is never masked by other successful
             # publishes. Unpublished tags are retried individually below.
-            published_tags > /tmp/tags.txt
+            scripts/shipped-set.sh --raw > /tmp/tags.txt
             for major in $pending_majors; do
               pd=$(jq -r --arg m "$major" '.[$m].pending.digest // empty' <<< "$state")
               pat=$(jq -r --arg m "$major" '.[$m].pending.dispatched_at // empty' <<< "$state")
@@ -226,66 +217,19 @@ jobs:
           [ "${FORCE}" = "true" ] && drifted="$majors"
 
           if [ -n "${drifted}" ] || [ -s "$retry_targets" ]; then
-            # Every currently-shipped version of the affected variants:
-            # published tags grouped by manifest digest, per variant family
-            # the newest patch of each of the two newest minor versions.
-            # Unpublished retry targets from the confirmation above are
-            # prepended verbatim (retry only what failed, not the whole
-            # family) and deduped against fresh drift dispatches.
-            [ -f /tmp/tags.txt ] || published_tags > /tmp/tags.txt
-            selector_out=$(python3 - "${drifted}" /tmp/tags.txt <<'PYEOF'
-          import re
-          import sys
-          from collections import defaultdict
-
-          drifted = set(sys.argv[1].split())
-
-          by_digest = {}
-          for line in open(sys.argv[2]):
-              parts = line.split()
-              name, digest = parts[0], parts[1]
-              by_digest.setdefault(digest, []).append(name)
-
-          def family(n):
-              fips = "-fips" if "openssl-fips" in n else ""
-              m = re.match(r"^ubi(\d+)", n)
-              return f"ubi{m.group(1) if m else '8'}{fips}"
-
-          fams = defaultdict(list)
-          for digest, names in by_digest.items():
-              versions = set()
-              for n in names:
-                  # anchored with an optional -pre suffix: pre-release
-                  # content publishes only -pre tags, stable only plain
-                  m = re.search(r"v(\d+)\.(\d+)\.(\d+)(-pre)?$", n)
-                  if m:
-                      versions.add((int(m[1]), int(m[2]), int(m[3])))
-              fams[family(names[0])].append({"digest": digest, "tags": names, "versions": versions})
-
-          for key, entries in fams.items():
-              major = key[len("ubi"):].split("-")[0]
-              if major not in drifted:
-                  continue
-              minors = sorted({v[:2] for e in entries for v in e["versions"]}, reverse=True)[:2]
-              for minor in minors:
-                  best = None
-                  for e in entries:
-                      for v in e["versions"]:
-                          if v[:2] == minor and (best is None or v > best[0]):
-                              best = (v, e)
-                  if best:
-                      v, e = best
-                      flavor = "fips" if key.endswith("-fips") else "standard"
-                      # Rebuild the exact published version: an empty
-                      # go_version would build the latest upstream release,
-                      # skipping the selected shipped version whenever
-                      # upstream has moved past it. New upstream versions
-                      # are the scheduled dispatcher's job, not this check's.
-                      suffix = "v%d.%d.%d" % v
-                      tag = next(n for n in e["tags"] if n.endswith(suffix) or n.endswith(suffix + "-pre"))
-                      print("%s %s %d.%d.%d %s" % (major, flavor, v[0], v[1], v[2], tag))
-          PYEOF
-            )
+            # Every currently-shipped version of the affected variants,
+            # from the shared selector: filter to the drifted majors and
+            # remap to major/flavor/version/tag, the newest minor
+            # dispatching as LATEST (build latest), matching the
+            # dispatcher's convention. Unpublished retry targets from
+            # the confirmation above are prepended verbatim (retry only
+            # what failed, not the whole family) and deduped against
+            # fresh drift dispatches.
+            [ -f /tmp/tags.txt ] || scripts/shipped-set.sh --raw > /tmp/tags.txt
+            selector_out=$(scripts/shipped-set.sh \
+              | awk -F'\t' -v want="${drifted}" \
+                  'BEGIN { n = split(want, w, " "); for (i = 1; i <= n; i++) wanted[w[i]] = 1 }
+                   wanted[$2] { print $2 "\t" $3 "\t" ($8 == 1 ? "LATEST" : $1) "\t" $6 }')
             targets=$( { cat "$retry_targets"; echo "$selector_out"; } | sed '/^$/d' | sort -u)
             : > /tmp/dispatched.txt
             while read -r major flavor version tag; do
