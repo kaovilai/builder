@@ -102,7 +102,7 @@ jobs:
                 "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
               # godev filtered in jq: a page holding only godev tags would
               # make grep exit 1 and abort the run
-              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | "\(.name) \(.manifest_digest) \(.last_modified)"'
+              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | select((.name | endswith("-pre")) | not) | "\(.name) \(.manifest_digest) \(.last_modified)"'
               [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
               page=$((page + 1))
             done
