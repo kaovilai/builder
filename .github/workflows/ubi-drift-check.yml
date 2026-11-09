@@ -229,11 +229,18 @@ jobs:
             selector_out=$(scripts/shipped-set.sh \
               | awk -F'\t' -v want="${drifted}" \
                   'BEGIN { n = split(want, w, " "); for (i = 1; i <= n; i++) wanted[w[i]] = 1 }
-                   wanted[$2] { print $2 "\t" $3 "\t" ($8 == 1 ? "LATEST" : $1) "\t" $6 }')
+                   # space-separated to match the retry-target format, so
+                   # the dedup below sees one form of each target
+                   wanted[$2] { print $2, $3, ($8 == 1 ? "LATEST" : $1), $6 }')
             targets=$( { cat "$retry_targets"; echo "$selector_out"; } | sed '/^$/d' | sort -u)
             : > /tmp/dispatched.txt
             while read -r major flavor version tag; do
               [ -n "$major" ] || continue
+              # the newest minor dispatches with an empty go_version
+              # (build latest), matching the dispatcher's convention
+              # (an if, not &&-and: the bare compound would fail the
+              # loop under set -e for every non-LATEST target)
+              if [ "$version" = "LATEST" ]; then version=""; fi
               if [ "${DRY_RUN}" = "true" ]; then
                 echo "  [dry-run] would dispatch build.yml (ubi=${major} flavor=${flavor} go_version='${version}')"
               elif [ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then

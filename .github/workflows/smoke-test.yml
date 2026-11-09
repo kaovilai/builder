@@ -30,6 +30,9 @@ jobs:
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
     steps:
+      - name: add checkout action...
+        uses: actions/checkout@v7
+
       - name: Resolve published images to verify
         id: set
         run: |

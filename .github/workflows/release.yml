@@ -43,6 +43,9 @@ jobs:
       GH_REPO: ${{ github.repository }}
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
     steps:
+      - name: add checkout action...
+        uses: actions/checkout@v7
+
       - name: Create releases for published versions
         run: |
           set -euo pipefail
