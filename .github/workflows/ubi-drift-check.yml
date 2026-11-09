@@ -232,7 +232,13 @@ jobs:
                    # space-separated to match the retry-target format, so
                    # the dedup below sees one form of each target
                    wanted[$2] { print $2, $3, ($8 == 1 ? "LATEST" : $1), $6 }')
-            targets=$( { cat "$retry_targets"; echo "$selector_out"; } | sed '/^$/d' | sort -u)
+            # dedupe on major/flavor/tag, not the version field: a
+            # newest-minor retry carries an explicit version while a
+            # fresh drift selection for the same tag carries LATEST —
+            # both would dispatch a duplicate build. The whole-line sort
+            # keeps the explicit retry (an explicit version sorts before
+            # LATEST), which pins exactly what the pending round wanted.
+            targets=$( { cat "$retry_targets"; echo "$selector_out"; } | sed '/^$/d' | sort -u -k1,2 -k4,4)
             : > /tmp/dispatched.txt
             while read -r major flavor version tag; do
               [ -n "$major" ] || continue
