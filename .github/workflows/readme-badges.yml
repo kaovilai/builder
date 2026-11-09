@@ -71,15 +71,49 @@ jobs:
           # of that Go version had been published when the tag was last
           # pushed. "false" when no matching release exists at all (no
           # evidence of a pre-release source).
-          fips_pre() { # $1 = Go version, $2 = tag last_modified (RFC 1123)
-            local ts_iso
+          # the exact go-fips source tag recorded in the image config at
+          # build time (image-build.yml labels it io.konveyor.builder.
+          # go-fips-source) — read back through the quay registry v2 API
+          QUAY_TOKEN="$(curl -sfS --retry 3 \
+            "https://quay.io/v2/auth?service=quay.io&scope=repository:konveyor/builder:pull" \
+            | jq -r .token)"
+          fips_source_label() { # $1 = manifest-list digest -> source tag ("" when unlabeled)
+            local list plat cfg
+            list=$(curl -sfS --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
+              -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" \
+              "https://quay.io/v2/konveyor/builder/manifests/$1")
+            plat=$(jq -r '.manifests[0].digest' <<< "$list")
+            plat=$(curl -sfS --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+              "https://quay.io/v2/konveyor/builder/manifests/$plat")
+            cfg=$(jq -r '.config.digest' <<< "$plat")
+            curl -sfSL --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
+              "https://quay.io/v2/konveyor/builder/blobs/$cfg" \
+              | jq -r '.config.Labels["io.konveyor.builder.go-fips-source"] // ""'
+          }
+
+          fips_pre() { # $1 = Go version, $2 = tag last_modified, $3 = manifest digest
+            # exact source tag first (no timing race); images built before
+            # the label existed fall back to the push-time rule
+            local label ts_iso
+            label="$(fips_source_label "$3")"
+            if [ -n "$label" ]; then
+              jq -r --arg t "$label" '
+                [ .[] | select(.draft == false)
+                  | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
+                  | {tag: .tag_name, pre: .prerelease} ]
+                | map(select(.tag == $t))
+                | if length == 0 then "unknown" else .[0].pre end
+              ' <<< "$FIPS_RELEASES"
+              return
+            fi
             ts_iso="$(date -u -d "$2" +%Y-%m-%dT%H:%M:%SZ)"
             jq -r --arg v "$1" --arg ts "$ts_iso" '
               [ .[] | select(.draft == false)
                 | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
                 | select(.tag_name | startswith("go" + $v + "-"))
                 | {tag: .tag_name, pre: .prerelease, at: .published_at} ]
-              | if length == 0 then false
+              | if length == 0 then "unknown"
                 else ([ .[] | select(.pre == false) | select(.at <= $ts) ] | length) == 0
                 end
             ' <<< "$FIPS_RELEASES"
