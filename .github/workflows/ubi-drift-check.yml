@@ -269,12 +269,7 @@ jobs:
               # and latest<version> aliases)
               latest_json="[]"
               while read -r flavor; do
-                case "${major}:${flavor}" in
-                  8:standard) prefix="" ;;
-                  8:fips)     prefix="openssl-fips-" ;;
-                  *:standard) prefix="ubi${major}-" ;;
-                  *)          prefix="ubi${major}-openssl-fips-" ;;
-                esac
+                prefix="$(scripts/variant-prefix.sh "$major" "$flavor")"
                 # both alias kinds: plain latest backs stable content,
                 # latest-pre backs pre-release content
                 for alias in "${prefix}latest" "${prefix}latest-pre"; do

@@ -68,14 +68,9 @@ jobs:
           # follow the published scheme (ubi8 unprefixed, ubi9/ubi10 prefixed).
           variants=$(grep -vE '^[[:space:]]*(#|$)' variants.txt | sort -n)
 
-          variant_prefix() {
-            # $1 = ubi major, $2 = flavor; patterns are flavor:major
-            case "$2:$1" in
-              standard:8) echo "" ;;
-              standard:*) echo "ubi$1-" ;;
-              fips:8)     echo "openssl-fips-" ;;
-              fips:*)     echo "ubi$1-openssl-fips-" ;;
-            esac
+          # the tag-naming contract is owned by scripts/variant-prefix.sh
+          variant_prefix() { # $1 = ubi major, $2 = flavor
+            scripts/variant-prefix.sh "$1" "$2"
           }
 
           # Collect all active tags published to quay.io/konveyor/builder.
@@ -146,18 +141,10 @@ jobs:
           echo "Checking OpenSSL FIPS image versions ..."
           # jq -s 'add' flattens the paginated response into one array regardless
           # of how gh emits pages, so the selection below always sees all releases.
-          fips_releases=$(gh api repos/golang-fips/go/releases --paginate | jq -s 'add')
-          mapfile -t FIPS_ENTRIES < <(echo "$fips_releases" | jq -r '
-            def cands: [ .[] | select(.draft == false)
-              | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
-              | {tag: .tag_name, pre: .prerelease} ];
-            def vkey: (.tag | split("-")[0] | ltrimstr("go") | split(".") | map(tonumber));
-            def bkey: (.tag | split("-")[1] | tonumber);
-            def ossl: (if .tag | endswith("openssl-fips") then 1 else 0 end);
-            def best: max_by([ (if .pre then 0 else 1 end), vkey, bkey, ossl ]);
-            cands | group_by(vkey | .[0:2]) | sort_by(.[0] | vkey | .[0:2]) | reverse
-            | .[0:2] | map(best)
-            | to_entries[] | "\(.key) \(.value.pre) \(.value.tag | split("-")[0] | ltrimstr("go"))"
+          # the two newest minors' best releases, newest first — the
+          # selection rules are owned by scripts/go-fips-releases.sh
+          mapfile -t FIPS_ENTRIES < <(scripts/go-fips-releases.sh --top2 | jq -r '
+            to_entries[] | "\(.key) \(.value.pre) \(.value.version)"
           ')
 
           for entry in "${FIPS_ENTRIES[@]}"; do

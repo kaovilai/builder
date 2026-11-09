@@ -62,41 +62,21 @@ jobs:
           fi
 
           if [ "$FLAVOR" = "fips" ]; then
-            # Fetch golang-fips/go releases (newest first from GitHub API)
-            # Uses gh api for authenticated requests (higher rate limit)
-            fips_releases=$(gh api repos/golang-fips/go/releases --paginate | jq -s 'add')
-
             # FIPS tag selection (same rules as scheduled_dispatch.yml):
-            # - candidates: non-draft releases tagged go<version>-<build>-(openssl-fips|hostfips-release);
-            #   the pure-digit build segment excludes rc tags (e.g. go1.18.3-0.rc1-openssl-fips)
-            # - golang-fips ships Go 1.27+ FIPS via the native crypto/fips140 module
-            #   ("hostfips-release" tags); older minors keep "openssl-fips" tags
-            # - per minor: prefer the newest stable release, falling back to the newest
-            #   prerelease when that minor has no stable release yet
+            # - golang-fips ships Go 1.27+ FIPS via the native crypto/fips140
+            #   module ("hostfips-release" tags); older minors keep
+            #   "openssl-fips" tags
+            # - per minor: prefer the newest stable release, falling back to the
+            #   newest prerelease when that minor has no stable release yet
             # - top 2 minor versions, matching Go's two-release support policy
-            JQ_FIPS='
-              def cands: [ .[] | select(.draft == false)
-                | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
-                | {tag: .tag_name, pre: .prerelease} ];
-              def vkey: (.tag | split("-")[0] | ltrimstr("go") | split(".") | map(tonumber));
-              def bkey: (.tag | split("-")[1] | tonumber);
-              def ossl: (if .tag | endswith("openssl-fips") then 1 else 0 end);
-              def best: max_by([ (if .pre then 0 else 1 end), vkey, bkey, ossl ]);
-            '
-            top2() {
-              echo "$fips_releases" | jq -c "${JQ_FIPS}"'
-                cands | group_by(vkey | .[0:2]) | sort_by(.[0] | vkey | .[0:2]) | reverse
-                | .[0:2] | map(best)
-              '
-            }
-
+            # (the selection rules are owned by scripts/go-fips-releases.sh)
             if [ "${{ github.event_name }}" = "pull_request" ]; then
-              matrix=$(top2 | jq -c '
+              matrix=$(scripts/go-fips-releases.sh --top2 | jq -c '
                 to_entries |
                 map({
                   build_arg: ("FIPS_TAG=" + .value.tag),
                   version_safe: (.value.tag | gsub("/"; "-")),
-                  tag_suffix: (if .key == 0 then "" else (.value.tag | split("-")[0] | ltrimstr("go")) end),
+                  tag_suffix: (if .key == 0 then "" else .value.version end),
                   pre: .value.pre
                 }) |
                 {include: .}
@@ -104,27 +84,22 @@ jobs:
             else
               if [ -n "$INPUT_VERSION" ]; then
                 # Find matching FIPS tag for provided Go version
-                fips_sel=$(echo "$fips_releases" | jq -r --arg v "go${INPUT_VERSION}" "${JQ_FIPS}"'
-                  cands | map(select(.tag | startswith($v + "-"))) | best | "\(.tag) \(.pre)"
-                ')
-                fips_tag=$(cut -d' ' -f1 <<< "$fips_sel")
-                fips_pre=$(cut -d' ' -f2 <<< "$fips_sel")
-                if [ -z "$fips_tag" ] || [ "$fips_tag" = "null" ]; then
+                fips_sel=$(scripts/go-fips-releases.sh --best-for "$INPUT_VERSION")
+                if [ -z "$fips_sel" ]; then
                   echo "ERROR: No golang-fips release found for go${INPUT_VERSION}"
                   exit 1
                 fi
-                matrix=$(jq -nc --arg t "$fips_tag" --arg s "$INPUT_VERSION" --argjson p "${fips_pre:-false}" \
-                  '{include: [{build_arg: ("FIPS_TAG=" + $t), version_safe: ($t | gsub("/"; "-")), tag_suffix: $s, pre: $p}]}')
+                matrix=$(jq -nc --arg s "$INPUT_VERSION" --argjson sel "$fips_sel" \
+                  '{include: [{build_arg: ("FIPS_TAG=" + $sel.tag), version_safe: ($sel.tag | gsub("/"; "-")), tag_suffix: $s, pre: $sel.pre}]}')
               else
                 # Empty input = latest (best release of the newest minor)
-                fips_tag=$(top2 | jq -r '.[0].tag')
-                fips_pre=$(top2 | jq -r '.[0].pre')
-                if [ -z "$fips_tag" ] || [ "$fips_tag" = "null" ]; then
+                fips_sel=$(scripts/go-fips-releases.sh --top2 | jq -c '.[0]')
+                if [ -z "$fips_sel" ]; then
                   echo "ERROR: No golang-fips releases matched the candidate filter"
                   exit 1
                 fi
-                matrix=$(jq -nc --arg t "$fips_tag" --argjson p "${fips_pre:-false}" \
-                  '{include: [{build_arg: ("FIPS_TAG=" + $t), version_safe: ($t | gsub("/"; "-")), tag_suffix: "", pre: $p}]}')
+                matrix=$(jq -nc --argjson sel "$fips_sel" \
+                  '{include: [{build_arg: ("FIPS_TAG=" + $sel.tag), version_safe: ($sel.tag | gsub("/"; "-")), tag_suffix: "", pre: $sel.pre}]}')
               fi
             fi
           else
@@ -204,15 +179,11 @@ jobs:
             echo "FIPS_SOURCE_TAG=" >> $GITHUB_ENV
           fi
           platform=${{ matrix.platform }}
-          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
-          echo "VERSION_SAFE=$VERSION_SAFE_INPUT" >> $GITHUB_ENV
-          case "${FLAVOR}:${UBI}" in
-            standard:8) prefix="" ;;
-            standard:*) prefix="ubi${UBI}-" ;;
-            fips:8)     prefix="openssl-fips-" ;;
-            fips:*)     prefix="ubi${UBI}-openssl-fips-" ;;
-          esac
-          echo "PREFIX=$prefix" >> $GITHUB_ENV
+          {
+            echo "PLATFORM_PAIR=${platform//\//-}"
+            echo "VERSION_SAFE=$VERSION_SAFE_INPUT"
+            echo "PREFIX=$(scripts/variant-prefix.sh "$UBI" "$FLAVOR")"
+          } >> $GITHUB_ENV
 
       - name: add checkout action...
         uses: actions/checkout@v7
@@ -435,13 +406,7 @@ jobs:
           else
             echo "TAG_KIND=" >> $GITHUB_ENV
           fi
-          case "${FLAVOR}:${UBI}" in
-            standard:8) prefix="" ;;
-            standard:*) prefix="ubi${UBI}-" ;;
-            fips:8)     prefix="openssl-fips-" ;;
-            fips:*)     prefix="ubi${UBI}-openssl-fips-" ;;
-          esac
-          echo "PREFIX=$prefix" >> $GITHUB_ENV
+          echo "PREFIX=$(scripts/variant-prefix.sh "$UBI" "$FLAVOR")" >> $GITHUB_ENV
 
       - name: download digests...
         uses: actions/download-artifact@v8
