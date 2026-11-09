@@ -43,132 +43,25 @@ jobs:
       GH_REPO: ${{ github.repository }}
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
     steps:
+      - name: add checkout action...
+        uses: actions/checkout@v7
+
       - name: Create releases for published versions
         run: |
           set -euo pipefail
           shopt -s inherit_errexit
 
-          published_tags() {
-            local page=1 resp
-            while :; do
-              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
-                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
-              # godev filtered in jq: a page holding only godev tags would
-              # make grep exit 1 and abort the run
-              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | "\(.name) \(.manifest_digest) \(.last_modified)"'
-              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
-              page=$((page + 1))
-            done
-          }
+          # Shipped set: the shared selector (scripts/shipped-set.sh), remapped
+          # to version/family/digest/tag/last_modified.
+          scripts/shipped-set.sh \
+            | awk -F'\t' '{print $1"\t"$4"\t"$5"\t"$6"\t"$7}' > /tmp/shipped.tsv
 
-          # Shipped set: tags grouped by manifest digest, per variant family
-          # the newest patch of each of the two newest minor versions.
-          published_tags > /tmp/tags.txt
-          python3 - /tmp/tags.txt > /tmp/shipped.tsv <<'PYEOF'
-          import re
-          import sys
-          from collections import defaultdict
-
-          by_digest = {}
-          last_modified = {}
-          for line in open(sys.argv[1]):
-              name, digest, when = line.split(None, 2)
-              when = when.strip()
-              by_digest.setdefault(digest, []).append(name)
-              last_modified[name] = when
-
-          def family(n):
-              fips = "-fips" if "openssl-fips" in n else ""
-              m = re.match(r"^ubi(\d+)", n)
-              return f"ubi{m.group(1) if m else '8'}{fips}"
-
-          fams = defaultdict(list)
-          for digest, names in by_digest.items():
-              versions = set()
-              for n in names:
-                  # anchored with an optional -pre suffix: pre-release
-                  # content publishes only -pre tags, stable only plain
-                  m = re.search(r"v(\d+)\.(\d+)\.(\d+)(-pre)?$", n)
-                  if m:
-                      versions.add((int(m[1]), int(m[2]), int(m[3])))
-              fams[family(names[0])].append({"digest": digest, "tags": names, "versions": versions})
-
-          # release version -> list of (family, digest, version, tag)
-          releases = defaultdict(list)
-          for key, entries in fams.items():
-              minors = sorted({v[:2] for e in entries for v in e["versions"]}, reverse=True)[:2]
-              for minor in minors:
-                  best = None
-                  for e in entries:
-                      for v in e["versions"]:
-                          if v[:2] == minor and (best is None or v > best[0]):
-                              best = (v, e)
-                  if best:
-                      v, e = best
-                      suffix = "v%d.%d.%d" % v
-                      tag = next(n for n in e["tags"] if n.endswith(suffix) or n.endswith(suffix + "-pre"))
-                      releases["%d.%d.%d" % v].append((key, e["digest"], v, tag))
-
-          for version in sorted(releases):
-              for family, digest, v, tag in sorted(releases[version]):
-                  print("%s\t%s\t%s\t%s\t%s" % (version, family, digest, tag, last_modified[tag]))
-          PYEOF
-
-          # golang-fips source releases (same candidate filter and ordering
-          # as image-build.yml's FIPS selection): a FIPS family's images are
-          # "pre-release" when the best golang-fips release of exactly their
-          # Go version is still marked pre-release — stable and pre-release
-          # sources are indistinguishable in the quay tag name alone.
-          FIPS_RELEASES="$(gh api repos/golang-fips/go/releases --paginate | jq -s 'add')"
-          # the exact go-fips source tag recorded in the image config at
-          # build time (image-build.yml labels it io.konveyor.builder.
-          # go-fips-source) — read back through the quay registry v2 API
-          QUAY_TOKEN="$(curl -sfS --retry 3 \
-            "https://quay.io/v2/auth?service=quay.io&scope=repository:konveyor/builder:pull" \
-            | jq -r .token)"
-          fips_source_label() { # $1 = manifest-list digest -> source tag ("" when unlabeled)
-            local list plat cfg
-            list=$(curl -sfS --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
-              -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" \
-              "https://quay.io/v2/konveyor/builder/manifests/$1")
-            plat=$(jq -r '.manifests[0].digest' <<< "$list")
-            plat=$(curl -sfS --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
-              -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
-              "https://quay.io/v2/konveyor/builder/manifests/$plat")
-            cfg=$(jq -r '.config.digest' <<< "$plat")
-            curl -sfSL --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
-              "https://quay.io/v2/konveyor/builder/blobs/$cfg" \
-              | jq -r '.config.Labels["io.konveyor.builder.go-fips-source"] // ""'
-          }
-
-          fips_pre() { # $1 = Go version, $2 = tag last_modified, $3 = manifest digest
-            # exact source tag first (no timing race); images built before
-            # the label existed fall back to the push-time rule: the image
-            # is pre-release iff no stable release of that Go version had
-            # been published when the tag was last pushed
-            local label ts_iso
-            label="$(fips_source_label "$3")"
-            if [ -n "$label" ]; then
-              jq -r --arg t "$label" '
-                [ .[] | select(.draft == false)
-                  | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
-                  | {tag: .tag_name, pre: .prerelease} ]
-                | map(select(.tag == $t))
-                | if length == 0 then "unknown" else .[0].pre end
-              ' <<< "$FIPS_RELEASES"
-              return
-            fi
-            ts_iso="$(date -u -d "$2" +%Y-%m-%dT%H:%M:%SZ)"
-            jq -r --arg v "$1" --arg ts "$ts_iso" '
-              [ .[] | select(.draft == false)
-                | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
-                | select(.tag_name | startswith("go" + $v + "-"))
-                | {tag: .tag_name, pre: .prerelease, at: .published_at} ]
-              | if length == 0 then "unknown"
-                else ([ .[] | select(.pre == false) | select(.at <= $ts) ] | length) == 0
-                end
-            ' <<< "$FIPS_RELEASES"
-          }
+          # golang-fips source releases and the pre-release classification of
+          # published FIPS images — both owned by shared scripts (see
+          # CONTRIBUTING): go-fips-releases.sh for the release list,
+          # fips-classify.sh for the label-first classification with the
+          # push-time fallback for pre-label images.
+          scripts/go-fips-releases.sh > /tmp/fips-releases.json
 
           # SBOMs are generated per platform (mirrors the build matrix in
           # image-build.yml): a manifest-list scan only covers the runner's
@@ -315,7 +208,7 @@ jobs:
                   # plain tags: classify by the recorded source (label)
                   # or, for pre-label images, by push timing
                   *)
-                    case "$(fips_pre "$ver" "$lm" "$d")" in
+                    case "$(scripts/fips-classify.sh /tmp/fips-releases.json "$ver" "$lm" "$d")" in
                       true)  pre_entries+="${line}"$'\n' ;;
                       false) stable_entries+="${line}"$'\n' ;;
                       *)

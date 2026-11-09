@@ -45,106 +45,46 @@ jobs:
           # tag list instead of failing the run.
           shopt -s inherit_errexit
 
-          # Collect all active tags published to quay.io/konveyor/builder.
-          published_tags() {
-            local page=1 resp
-            while :; do
-              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
-                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
-              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest) \(.last_modified)"' 
-              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
-              page=$((page + 1))
-            done
-          }
-          PUBLISHED_TAGS="$(published_tags)"
+          # Shipped set: the shared selector (scripts/shipped-set.sh) —
+          # one row per shipped image:
+          # version major flavor family digest tag last_modified newest
+          scripts/shipped-set.sh > /tmp/shipped.tsv
 
           # golang-fips source releases (same candidate filter as
           # image-build.yml's FIPS selection), so FIPS badges can say
           # whether their published version is built from a stable or a
           # pre-release go-fips tag — the two are indistinguishable in the
           # quay tag name alone.
-          FIPS_RELEASES="$(gh api repos/golang-fips/go/releases --paginate | jq -s 'add')"
-
-          # Pre-release status of the go-fips source behind an image tag:
-          # builds always use the best release of the version current at
-          # build time, so the image is pre-release iff no stable release
-          # of that Go version had been published when the tag was last
-          # pushed. "false" when no matching release exists at all (no
-          # evidence of a pre-release source).
-          # the exact go-fips source tag recorded in the image config at
-          # build time (image-build.yml labels it io.konveyor.builder.
-          # go-fips-source) — read back through the quay registry v2 API
-          QUAY_TOKEN="$(curl -sfS --retry 3 \
-            "https://quay.io/v2/auth?service=quay.io&scope=repository:konveyor/builder:pull" \
-            | jq -r .token)"
-          fips_source_label() { # $1 = manifest-list digest -> source tag ("" when unlabeled)
-            local list plat cfg
-            list=$(curl -sfS --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
-              -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" \
-              "https://quay.io/v2/konveyor/builder/manifests/$1")
-            plat=$(jq -r '.manifests[0].digest' <<< "$list")
-            plat=$(curl -sfS --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
-              -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
-              "https://quay.io/v2/konveyor/builder/manifests/$plat")
-            cfg=$(jq -r '.config.digest' <<< "$plat")
-            curl -sfSL --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
-              "https://quay.io/v2/konveyor/builder/blobs/$cfg" \
-              | jq -r '.config.Labels["io.konveyor.builder.go-fips-source"] // ""'
-          }
-
-          fips_pre() { # $1 = Go version, $2 = tag last_modified, $3 = manifest digest
-            # exact source tag first (no timing race); images built before
-            # the label existed fall back to the push-time rule
-            local label ts_iso
-            label="$(fips_source_label "$3")"
-            if [ -n "$label" ]; then
-              jq -r --arg t "$label" '
-                [ .[] | select(.draft == false)
-                  | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
-                  | {tag: .tag_name, pre: .prerelease} ]
-                | map(select(.tag == $t))
-                | if length == 0 then "unknown" else .[0].pre end
-              ' <<< "$FIPS_RELEASES"
-              return
-            fi
-            ts_iso="$(date -u -d "$2" +%Y-%m-%dT%H:%M:%SZ)"
-            jq -r --arg v "$1" --arg ts "$ts_iso" '
-              [ .[] | select(.draft == false)
-                | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
-                | select(.tag_name | startswith("go" + $v + "-"))
-                | {tag: .tag_name, pre: .prerelease, at: .published_at} ]
-              | if length == 0 then "unknown"
-                else ([ .[] | select(.pre == false) | select(.at <= $ts) ] | length) == 0
-                end
-            ' <<< "$FIPS_RELEASES"
-          }
-
-          # Latest go-fips release version with the given pre-release
-          # status ("true"/"false") — for the source-level stable and
-          # pre-release badges.
-          fips_latest() {
-            jq -r --argjson pre "$1" '
-              [ .[] | select(.draft == false)
-                | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
-                | select(.prerelease == $pre)
-                | (.tag_name | split("-")[0] | ltrimstr("go")) ]
-              | sort_by(split(".") | map(tonumber)) | last // empty
-            ' <<< "$FIPS_RELEASES"
-          }
+          # golang-fips source releases and the pre-release classification of
+          # published FIPS images — both owned by shared scripts (see
+          # CONTRIBUTING): go-fips-releases.sh for the release list,
+          # fips-classify.sh for the label-first classification with the
+          # push-time fallback for pre-label images.
+          scripts/go-fips-releases.sh > /tmp/fips-releases.json
+          
+                    # Latest go-fips release version with the given pre-release
+                    # status ("true"/"false") — for the source-level stable and
+                    # pre-release badges.
+                    fips_latest() {
+                      jq -rn --argjson pre "$1" --slurpfile r /tmp/fips-releases.json '
+                        [$r[0][] | select(.pre == $pre) | (.tag | split("-")[0] | ltrimstr("go"))]
+                        | sort_by(split(".") | map(tonumber)) | last // empty'
+                    }
 
           # Latest published Go version per image variant. Empty when the variant
-          # has no matching tag yet — grep exits 1 on no match, so the pipeline
-          # needs `|| true` to keep set -e/pipefail from aborting the run.
-          latest_for() { # $1 = published-tag regex → "<version>[-pre] <digest> <last_modified>" of the newest match
-            grep -E "$1" <<< "$PUBLISHED_TAGS" \
-              | sed -E 's/^.*v([0-9]+\.[0-9]+\.[0-9]+)(-pre)?[[:space:]]+(sha256:[a-f0-9]+)[[:space:]]+(.*)$/\1\2 \3 \4/' | sort -V | tail -1 || true
+          # Newest shipped row of a variant family — empty when the
+          # family has no shipped image yet (awk prints nothing and the
+          # pipeline needs `|| true` to keep set -e from aborting).
+          latest_for() { # $1 = family → "<version>\t<digest>\t<tag>\t<last_modified>" of the newest row
+            awk -F'\t' -v f="$1" '$4 == f {print $1"\t"$5"\t"$6"\t"$7}' /tmp/shipped.tsv \
+              | sort -t$'\t' -k1,1V | tail -1 || true
           }
 
           badge() {
-            # $1 = label, $2 = published-tag regex, $3 = color
+            # $1 = label, $2 = family, $3 = color
             local line ver
             line="$(latest_for "$2")"
-            ver="${line%% *}"
+            ver="$(cut -f1 <<< "$line")"
             if [ -n "$ver" ]; then
               echo "[![${1}](https://img.shields.io/badge/${1// /_}-Go_${ver}-${3})](https://quay.io/repository/konveyor/builder?tab=tags)"
             fi
@@ -155,15 +95,12 @@ jobs:
           # source is a pre-release tag (shields escapes a literal dash
           # as "--")
           fips_badge() {
-            # $1 = label, $2 = published-tag regex
-            local line ver rest digest ts suffix color
+            # $1 = label, $2 = family
+            local line ver digest tag ts suffix color
             line="$(latest_for "$2")"
-            ver="${line%% *}"
-            rest="${line#* }"
-            digest="${rest%% *}"
-            ts="${rest#* }"
+            IFS=$'\t' read -r ver digest tag ts <<< "$line"
             if [ -n "$ver" ]; then
-              case "$ver" in
+              case "$tag" in
                 # pre-release content publishes only -pre tags — the
                 # suffix is the classification
                 *-pre)
@@ -173,7 +110,7 @@ jobs:
                 # plain tags: classify by the recorded source (label) or,
                 # for pre-label images, by push timing
                 *)
-                  case "$(fips_pre "$ver" "$ts" "$digest")" in
+                  case "$(scripts/fips-classify.sh /tmp/fips-releases.json "$ver" "$ts" "$digest")" in
                     true)    suffix="_pre--release"; color=orange ;;
                     false)   suffix=""; color=blueviolet ;;
                     *)
@@ -205,11 +142,9 @@ jobs:
             # ubi8 publishes unprefixed tags; ubi9/ubi10 are prefixed.
             while read -r major flavor; do
               if [ "$flavor" = "fips" ]; then
-                if [ "$major" = "8" ]; then rx='^openssl-fips-v'; else rx="^ubi${major}-openssl-fips-v"; fi
-                fips_badge "UBI ${major} FIPS" "${rx}[0-9]+\.[0-9]+\.[0-9]+(-pre)?[[:space:]]"
+                fips_badge "UBI ${major} FIPS" "ubi${major}-fips"
               else
-                if [ "$major" = "8" ]; then rx='^v'; else rx="^ubi${major}-v"; fi
-                badge "UBI ${major}" "${rx}[0-9]+\.[0-9]+\.[0-9]+[[:space:]]" blue
+                badge "UBI ${major}" "ubi${major}" blue
               fi
             done < <(grep -vE '^[[:space:]]*(#|$)' variants.txt | sort -n)
           } > /tmp/badges.md

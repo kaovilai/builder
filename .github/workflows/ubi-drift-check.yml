@@ -94,19 +94,10 @@ jobs:
           state=$(cat "$state_file")
           pending_majors=$(jq -r '[to_entries[] | select(.value.pending) | .key] | join(" ")' <<< "$state")
 
-          # Active tags with manifest digest and last-modified timestamp.
-          published_tags() {
-            local page=1 resp
-            while :; do
-              resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
-                "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
-              # godev filtered in jq: a page holding only godev tags would
-              # make grep exit 1 and abort the run
-              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | "\(.name) \(.manifest_digest) \(.last_modified)"'
-              [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
-              page=$((page + 1))
-            done
-          }
+          # Active tags with manifest digest and last-modified timestamp:
+          # the shared selector's raw mode (tags outside the shipped set
+          # included — the publish confirmation looks up tags that may
+          # have graduated or moved on).
           retry_targets=/tmp/retry-targets.txt
           : > "$retry_targets"
           if [ -n "$pending_majors" ]; then
@@ -115,7 +106,7 @@ jobs:
             # republished after the dispatch, so a failed rebuild of one
             # flavor or version is never masked by other successful
             # publishes. Unpublished tags are retried individually below.
-            published_tags > /tmp/tags.txt
+            scripts/shipped-set.sh --raw > /tmp/tags.txt
             for major in $pending_majors; do
               pd=$(jq -r --arg m "$major" '.[$m].pending.digest // empty' <<< "$state")
               pat=$(jq -r --arg m "$major" '.[$m].pending.dispatched_at // empty' <<< "$state")
@@ -226,67 +217,36 @@ jobs:
           [ "${FORCE}" = "true" ] && drifted="$majors"
 
           if [ -n "${drifted}" ] || [ -s "$retry_targets" ]; then
-            # Every currently-shipped version of the affected variants:
-            # published tags grouped by manifest digest, per variant family
-            # the newest patch of each of the two newest minor versions.
+            # Every currently-shipped version of the affected variants,
+            # from the shared selector: filter to the drifted majors and
+            # remap to major/flavor/version/tag. Every dispatch carries
+            # the selected concrete version — an empty go_version (build
+            # latest) could build a newer upstream release than the
+            # selected tag if upstream moved mid-flight, leaving the
+            # selected image unpublished and the round pending. The
+            # moving latest aliases are refreshed by this workflow's own
+            # re-point logic after confirmation, not by these builds.
             # Unpublished retry targets from the confirmation above are
             # prepended verbatim (retry only what failed, not the whole
             # family) and deduped against fresh drift dispatches.
-            [ -f /tmp/tags.txt ] || published_tags > /tmp/tags.txt
-            selector_out=$(python3 - "${drifted}" /tmp/tags.txt <<'PYEOF'
-          import re
-          import sys
-          from collections import defaultdict
-
-          drifted = set(sys.argv[1].split())
-
-          by_digest = {}
-          for line in open(sys.argv[2]):
-              parts = line.split()
-              name, digest = parts[0], parts[1]
-              by_digest.setdefault(digest, []).append(name)
-
-          def family(n):
-              fips = "-fips" if "openssl-fips" in n else ""
-              m = re.match(r"^ubi(\d+)", n)
-              return f"ubi{m.group(1) if m else '8'}{fips}"
-
-          fams = defaultdict(list)
-          for digest, names in by_digest.items():
-              versions = set()
-              for n in names:
-                  # anchored with an optional -pre suffix: pre-release
-                  # content publishes only -pre tags, stable only plain
-                  m = re.search(r"v(\d+)\.(\d+)\.(\d+)(-pre)?$", n)
-                  if m:
-                      versions.add((int(m[1]), int(m[2]), int(m[3])))
-              fams[family(names[0])].append({"digest": digest, "tags": names, "versions": versions})
-
-          for key, entries in fams.items():
-              major = key[len("ubi"):].split("-")[0]
-              if major not in drifted:
-                  continue
-              minors = sorted({v[:2] for e in entries for v in e["versions"]}, reverse=True)[:2]
-              for minor in minors:
-                  best = None
-                  for e in entries:
-                      for v in e["versions"]:
-                          if v[:2] == minor and (best is None or v > best[0]):
-                              best = (v, e)
-                  if best:
-                      v, e = best
-                      flavor = "fips" if key.endswith("-fips") else "standard"
-                      # Rebuild the exact published version: an empty
-                      # go_version would build the latest upstream release,
-                      # skipping the selected shipped version whenever
-                      # upstream has moved past it. New upstream versions
-                      # are the scheduled dispatcher's job, not this check's.
-                      suffix = "v%d.%d.%d" % v
-                      tag = next(n for n in e["tags"] if n.endswith(suffix) or n.endswith(suffix + "-pre"))
-                      print("%s %s %d.%d.%d %s" % (major, flavor, v[0], v[1], v[2], tag))
-          PYEOF
-            )
-            targets=$( { cat "$retry_targets"; echo "$selector_out"; } | sed '/^$/d' | sort -u)
+            [ -f /tmp/tags.txt ] || scripts/shipped-set.sh --raw > /tmp/tags.txt
+            # selected from the SAME snapshot the alias bookkeeping reads
+            # below — a fresh crawl could pick up a publish that advanced
+            # latest between the two, leaving the new patch without an
+            # alias mapping and latest stale after the rebuild
+            selector_out=$(scripts/shipped-set.sh --from /tmp/tags.txt \
+              | awk -F'\t' -v want="${drifted}" \
+                  'BEGIN { n = split(want, w, " "); for (i = 1; i <= n; i++) wanted[w[i]] = 1 }
+                   # space-separated to match the retry-target format, so
+                   # the dedup below sees one form of each target
+                   wanted[$2] { print $2, $3, $1, $6 }')
+            # dedupe on major/flavor/tag, not the version field: a
+            # newest-minor retry carries an explicit version while a
+            # fresh drift selection for the same tag carries LATEST —
+            # both would dispatch a duplicate build. The whole-line sort
+            # keeps the explicit retry (an explicit version sorts before
+            # LATEST), which pins exactly what the pending round wanted.
+            targets=$( { cat "$retry_targets"; echo "$selector_out"; } | sed '/^$/d' | sort -u -k1,2 -k4,4)
             : > /tmp/dispatched.txt
             while read -r major flavor version tag; do
               [ -n "$major" ] || continue
@@ -313,34 +273,76 @@ jobs:
               # and latest<version> aliases)
               latest_json="[]"
               while read -r flavor; do
-                case "${major}:${flavor}" in
-                  8:standard) prefix="" ;;
-                  8:fips)     prefix="openssl-fips-" ;;
-                  *:standard) prefix="ubi${major}-" ;;
-                  *)          prefix="ubi${major}-openssl-fips-" ;;
-                esac
+                prefix="$(scripts/variant-prefix.sh "$major" "$flavor")"
                 # both alias kinds: plain latest backs stable content,
                 # latest-pre backs pre-release content
                 for alias in "${prefix}latest" "${prefix}latest-pre"; do
                   lat_d=$(awk -v t="$alias" '$1 == t {print $2; exit}' /tmp/tags.txt)
                   [ -n "$lat_d" ] || continue
+                  case "$alias" in
+                    *-pre) kind="-pre" ;;
+                    *)     kind="" ;;
+                  esac
+                  matched=""
                   while read -r t; do
                     if [ "$(awk -v x="$t" '$1 == x {print $2; exit}' /tmp/tags.txt)" = "$lat_d" ]; then
                       latest_json=$(jq -c --arg a "$alias" --arg w "$lat_d" --arg o "$t" \
                         '. + [{alias: $a, was: $w, of: $o}]' <<< "$latest_json")
+                      matched=1
                       break
                     fi
                   done < <(awk -v m="$major" -v f="$flavor" '$1 == m && $2 == f {print $3}' /tmp/dispatched.txt)
+                  if [ -n "$matched" ]; then
+                    continue
+                  fi
+                  # The alias serves an older patch than the selected
+                  # target (a rebuild can select a newer patch without
+                  # the alias advancing). Re-point it to this family's
+                  # newest dispatched target of the alias's kind, so the
+                  # rebuild refreshes it — but never demote an alias
+                  # already serving a newer promotion.
+                  # awk, not grep: a round dispatching only stable tags
+                  # finds no -pre target here, and grep's no-match exit
+                  # would abort after dispatching but before the pending
+                  # state is saved
+                  newest=$(awk -v m="$major" -v f="$flavor" '$1 == m && $2 == f {print $3}' /tmp/dispatched.txt \
+                    | awk -v k="$kind" '$0 ~ ("v[0-9.]+" k "$")' | sort -V | tail -1)
+                  [ -n "$newest" ] || continue
+                  newest_v=$(sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/' <<< "$newest")
+                  # a full patch tag of this prefix and kind: the first
+                  # other tag sharing the digest could be a minor alias
+                  # (v1.27) or a versioned latest alias (latest1.27.1),
+                  # whose names yield no parseable version
+                  lat_tag=$(awk -v d="$lat_d" -v re="^${prefix}v[0-9]+\.[0-9]+\.[0-9]+${kind}$" \
+                    '$2 == d && $1 ~ re {print $1; exit}' /tmp/tags.txt)
+                  lat_v=$(sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/' <<< "$lat_tag")
+                  if [ -n "$lat_v" ] && [ "$newest_v" != "$lat_v" ] \
+                    && [ "$(printf '%s\n%s\n' "$lat_v" "$newest_v" | sort -V | tail -1)" = "$newest_v" ]; then
+                    latest_json=$(jq -c --arg a "$alias" --arg w "$lat_d" --arg o "$newest" \
+                      '. + [{alias: $a, was: $w, of: $o}]' <<< "$latest_json")
+                  fi
                 done
               done < <(awk -v m="$major" '$1 == m {print $2}' /tmp/dispatched.txt | sort -u)
               now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
-              # union with the existing pending.latest by alias (new wins):
-              # a partial retry dispatches only the unpublished tags, and
-              # its fresh mappings can't cover an alias backed by an
-              # already-published target — dropping that mapping would
-              # strand the alias on the stale base forever
-              merged_latest=$(jq -c --arg m "$major" --argjson lt "$latest_json" \
-                '($lt) + [(.[$m].pending.latest // [])[] | select(.alias as $a | ($lt | map(.alias) | index($a)) | not)]' <<< "$state")
+              # union with the existing pending.latest by alias, keeping
+              # the mapping whose target is the newer version: a partial
+              # retry dispatches only the unpublished tags, so its fresh
+              # mappings can name an older patch than a mapping saved by
+              # the round that dispatched the newer one — new-wins would
+              # regress the alias to the older rebuild. An alias backed
+              # by an already-published target has no fresh mapping at
+              # all, so dropping the saved one would strand it on the
+              # stale base forever. Equal versions keep the fresh
+              # mapping: its `was` reflects the alias digest now.
+              merged_latest=$(jq -c --arg m "$major" --argjson lt "$latest_json" '
+                [ ((.[$m].pending.latest // [])[] | {mapping: ., fresh: 0}),
+                  ($lt[] | {mapping: ., fresh: 1}) ]
+                | group_by(.mapping.alias)
+                | map(max_by([ (.mapping.of
+                                | capture("v(?<v>[0-9]+\\.[0-9]+\\.[0-9]+)").v
+                                | split(".") | map(tonumber)),
+                               .fresh ]))
+                | map(.mapping)' <<< "$state")
               state=$(jq -c --arg m "$major" --arg d "$now" --arg t "$dispatched_at" --argjson tg "$targets_json" --argjson lt "$merged_latest" \
                 '.[$m] = ((.[$m] // {}) + {pending: {digest: $d, dispatched_at: $t, targets: $tg, latest: $lt}})' <<< "$state")
             done < <(awk '{print $1}' /tmp/dispatched.txt | sort -u)
