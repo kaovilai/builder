@@ -324,13 +324,25 @@ jobs:
                 done
               done < <(awk -v m="$major" '$1 == m {print $2}' /tmp/dispatched.txt | sort -u)
               now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
-              # union with the existing pending.latest by alias (new wins):
-              # a partial retry dispatches only the unpublished tags, and
-              # its fresh mappings can't cover an alias backed by an
-              # already-published target — dropping that mapping would
-              # strand the alias on the stale base forever
-              merged_latest=$(jq -c --arg m "$major" --argjson lt "$latest_json" \
-                '($lt) + [(.[$m].pending.latest // [])[] | select(.alias as $a | ($lt | map(.alias) | index($a)) | not)]' <<< "$state")
+              # union with the existing pending.latest by alias, keeping
+              # the mapping whose target is the newer version: a partial
+              # retry dispatches only the unpublished tags, so its fresh
+              # mappings can name an older patch than a mapping saved by
+              # the round that dispatched the newer one — new-wins would
+              # regress the alias to the older rebuild. An alias backed
+              # by an already-published target has no fresh mapping at
+              # all, so dropping the saved one would strand it on the
+              # stale base forever. Equal versions keep the fresh
+              # mapping: its `was` reflects the alias digest now.
+              merged_latest=$(jq -c --arg m "$major" --argjson lt "$latest_json" '
+                [ ((.[$m].pending.latest // [])[] | {mapping: ., fresh: 0}),
+                  ($lt[] | {mapping: ., fresh: 1}) ]
+                | group_by(.mapping.alias)
+                | map(max_by([ (.mapping.of
+                                | capture("v(?<v>[0-9]+\\.[0-9]+\\.[0-9]+)").v
+                                | split(".") | map(tonumber)),
+                               .fresh ]))
+                | map(.mapping)' <<< "$state")
               state=$(jq -c --arg m "$major" --arg d "$now" --arg t "$dispatched_at" --argjson tg "$targets_json" --argjson lt "$merged_latest" \
                 '.[$m] = ((.[$m] // {}) + {pending: {digest: $d, dispatched_at: $t, targets: $tg, latest: $lt}})' <<< "$state")
             done < <(awk '{print $1}' /tmp/dispatched.txt | sort -u)
