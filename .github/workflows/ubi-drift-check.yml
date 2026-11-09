@@ -301,12 +301,20 @@ jobs:
                   # newest dispatched target of the alias's kind, so the
                   # rebuild refreshes it — but never demote an alias
                   # already serving a newer promotion.
+                  # awk, not grep: a round dispatching only stable tags
+                  # finds no -pre target here, and grep's no-match exit
+                  # would abort after dispatching but before the pending
+                  # state is saved
                   newest=$(awk -v m="$major" -v f="$flavor" '$1 == m && $2 == f {print $3}' /tmp/dispatched.txt \
-                    | grep -E -- "v[0-9.]+${kind}\$" | sort -V | tail -1)
+                    | awk -v k="$kind" '$0 ~ ("v[0-9.]+" k "$")' | sort -V | tail -1)
                   [ -n "$newest" ] || continue
                   newest_v=$(sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/' <<< "$newest")
-                  # exclude the alias itself: it shares the digest it serves
-                  lat_tag=$(awk -v d="$lat_d" -v a="$alias" '$2 == d && $1 != a {print $1; exit}' /tmp/tags.txt)
+                  # a full patch tag of this prefix and kind: the first
+                  # other tag sharing the digest could be a minor alias
+                  # (v1.27) or a versioned latest alias (latest1.27.1),
+                  # whose names yield no parseable version
+                  lat_tag=$(awk -v d="$lat_d" -v re="^${prefix}v[0-9]+\.[0-9]+\.[0-9]+${kind}$" \
+                    '$2 == d && $1 ~ re {print $1; exit}' /tmp/tags.txt)
                   lat_v=$(sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/' <<< "$lat_tag")
                   if [ -n "$lat_v" ] && [ "$newest_v" != "$lat_v" ] \
                     && [ "$(printf '%s\n%s\n' "$lat_v" "$newest_v" | sort -V | tail -1)" = "$newest_v" ]; then
