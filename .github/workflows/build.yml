@@ -31,12 +31,14 @@ on:
     paths:
       - 'Dockerfile*'
       - 'variants.txt'
+      - 'scripts/**'
       - '.github/workflows/build.yml'
       - '.github/workflows/image-build.yml'
   pull_request:
     paths:
       - 'Dockerfile*'
       - 'variants.txt'
+      - 'scripts/**'
       - '.github/workflows/build.yml'
       - '.github/workflows/image-build.yml'
 
@@ -131,7 +133,7 @@ jobs:
               fi
             fi
             git diff --name-only "${base}" HEAD > /tmp/changed || git diff --name-only HEAD^ HEAD > /tmp/changed
-            if grep -qxE 'Dockerfile(-openssl-fips)?|variants\.txt|\.github/workflows/(build|image-build)\.yml' /tmp/changed; then
+            if grep -qxE 'Dockerfile(-openssl-fips)?|variants\.txt|scripts/.*|\.github/workflows/(build|image-build)\.yml' /tmp/changed; then
               : # shared change — keep every variant
             else
               variants='{"include": []}'
