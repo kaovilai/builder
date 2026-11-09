@@ -1,15 +1,20 @@
 name: 'Publish GitHub releases'
 
-# Creates one GitHub Release per published Go version (tag go<version>),
-# covering every variant shipped for it: release notes list the image tags
-# and digests, and SPDX SBOMs generated with Syft (one per platform, since
-# a manifest-list scan only covers the runner's architecture) are attached
-# as release assets. Existing releases are reconciled weekly — notes are
-# regenerated and missing SBOMs uploaded — so variants published after a
-# release was created still land in it. The shipped set is derived from
-# the tags published on quay.io/konveyor/builder (per variant family, the
-# newest patch of each of the two newest minor versions), so a release
-# appears once its images are published and gains nothing from EOL history.
+# Creates one GitHub Release per published Go version (tag go<version>)
+# covering every stably-sourced variant shipped for it, plus a separate
+# go<version>-fips pre-release release when the FIPS images of that version
+# are built from a pre-release golang-fips tag (the only pre-release source
+# this repo ships). Release notes list the image tags and digests, and SPDX
+# SBOMs generated with Syft (one per platform, since a manifest-list scan
+# only covers the runner's architecture) are attached as release assets.
+# Existing releases are reconciled weekly — notes are regenerated and
+# missing SBOMs uploaded — so variants published after a release was
+# created still land in it, and a graduated FIPS pre-release release (its
+# source now stable) is deleted in favor of the stable release. The
+# shipped set is derived from the tags published on
+# quay.io/konveyor/builder (per variant family, the newest patch of each
+# of the two newest minor versions), so a release appears once its images
+# are published and gains nothing from EOL history.
 # Uses the builtin GITHUB_TOKEN (contents: write for release creation).
 
 on:
@@ -50,7 +55,7 @@ jobs:
                 "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
               # godev filtered in jq: a page holding only godev tags would
               # make grep exit 1 and abort the run
-              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | "\(.name) \(.manifest_digest)"'
+              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | "\(.name) \(.manifest_digest) \(.last_modified)"'
               [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
               page=$((page + 1))
             done
@@ -65,9 +70,12 @@ jobs:
           from collections import defaultdict
 
           by_digest = {}
+          last_modified = {}
           for line in open(sys.argv[1]):
-              name, digest = line.split()
+              name, digest, when = line.split(None, 2)
+              when = when.strip()
               by_digest.setdefault(digest, []).append(name)
+              last_modified[name] = when
 
           def family(n):
               fips = "-fips" if "openssl-fips" in n else ""
@@ -100,8 +108,64 @@ jobs:
 
           for version in sorted(releases):
               for family, digest, v, tag in sorted(releases[version]):
-                  print("%s\t%s\t%s\t%s" % (version, family, digest, tag))
+                  print("%s\t%s\t%s\t%s\t%s" % (version, family, digest, tag, last_modified[tag]))
           PYEOF
+
+          # golang-fips source releases (same candidate filter and ordering
+          # as image-build.yml's FIPS selection): a FIPS family's images are
+          # "pre-release" when the best golang-fips release of exactly their
+          # Go version is still marked pre-release — stable and pre-release
+          # sources are indistinguishable in the quay tag name alone.
+          FIPS_RELEASES="$(gh api repos/golang-fips/go/releases --paginate | jq -s 'add')"
+          # the exact go-fips source tag recorded in the image config at
+          # build time (image-build.yml labels it io.konveyor.builder.
+          # go-fips-source) — read back through the quay registry v2 API
+          QUAY_TOKEN="$(curl -sfS --retry 3 \
+            "https://quay.io/v2/auth?service=quay.io&scope=repository:konveyor/builder:pull" \
+            | jq -r .token)"
+          fips_source_label() { # $1 = manifest-list digest -> source tag ("" when unlabeled)
+            local list plat cfg
+            list=$(curl -sfS --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
+              -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" \
+              "https://quay.io/v2/konveyor/builder/manifests/$1")
+            plat=$(jq -r '.manifests[0].digest' <<< "$list")
+            plat=$(curl -sfS --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+              "https://quay.io/v2/konveyor/builder/manifests/$plat")
+            cfg=$(jq -r '.config.digest' <<< "$plat")
+            curl -sfSL --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
+              "https://quay.io/v2/konveyor/builder/blobs/$cfg" \
+              | jq -r '.config.Labels["io.konveyor.builder.go-fips-source"] // ""'
+          }
+
+          fips_pre() { # $1 = Go version, $2 = tag last_modified, $3 = manifest digest
+            # exact source tag first (no timing race); images built before
+            # the label existed fall back to the push-time rule: the image
+            # is pre-release iff no stable release of that Go version had
+            # been published when the tag was last pushed
+            local label ts_iso
+            label="$(fips_source_label "$3")"
+            if [ -n "$label" ]; then
+              jq -r --arg t "$label" '
+                [ .[] | select(.draft == false)
+                  | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
+                  | {tag: .tag_name, pre: .prerelease} ]
+                | map(select(.tag == $t))
+                | if length == 0 then "unknown" else .[0].pre end
+              ' <<< "$FIPS_RELEASES"
+              return
+            fi
+            ts_iso="$(date -u -d "$2" +%Y-%m-%dT%H:%M:%SZ)"
+            jq -r --arg v "$1" --arg ts "$ts_iso" '
+              [ .[] | select(.draft == false)
+                | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
+                | select(.tag_name | startswith("go" + $v + "-"))
+                | {tag: .tag_name, pre: .prerelease, at: .published_at} ]
+              | if length == 0 then "unknown"
+                else ([ .[] | select(.pre == false) | select(.at <= $ts) ] | length) == 0
+                end
+            ' <<< "$FIPS_RELEASES"
+          }
 
           # SBOMs are generated per platform (mirrors the build matrix in
           # image-build.yml): a manifest-list scan only covers the runner's
@@ -113,6 +177,7 @@ jobs:
           PLATFORMS="linux/amd64 linux/arm64 linux/ppc64le linux/s390x"
           expected_assets() { # $1=entries — must match make_sboms' naming
             while IFS=$'\t' read -r _ f d t; do
+              [ -n "$f" ] || continue # entries carry a trailing newline
               for platform in $PLATFORMS; do
                 echo "${f}-${platform//\//-}-${d#sha256:}.spdx.json"
               done
@@ -120,6 +185,7 @@ jobs:
           }
           make_sboms() { # $1=entries $2=sbom_dir $3=file listing existing asset names
             while IFS=$'\t' read -r _ f d t; do
+              [ -n "$f" ] || continue # entries carry a trailing newline
               # scan by digest: the tag is mutable and could be re-published
               # between selection and scan, making SBOM and notes disagree
               image="quay.io/konveyor/builder@${d}"
@@ -132,65 +198,149 @@ jobs:
             done <<< "$1"
           }
 
-          while IFS=$'\t' read -r version _ _ _; do
-            release_tag="go${version}"
-
-            # collect every shipped image of this version
-            entries=$(awk -F'\t' -v v="$version" '$1 == v' /tmp/shipped.tsv)
+          # publish_release <tag> <title> <entries> <prerelease-flag> <kind>
+          # Creates the release with its SBOMs, or reconciles an existing
+          # one (notes regenerated, only missing SBOM assets scanned and
+          # uploaded, stale assets pruned) — the same lifecycle the single
+          # per-version release had, applied to each release separately.
+          publish_release() {
+            local tag="$1" title="$2" entries="$3" preflag="$4" kind="$5" crossref="${6:-}"
+            if [ -z "$entries" ]; then
+              # No shipped images remain for this release: the content
+              # either graduated (a pre-release FIPS source went stable
+              # and moved into the stable release) or moved on to a newer
+              # version. An existing release would keep describing
+              # no-longer-shipped images, so remove it.
+              if gh release view "$tag" >/dev/null 2>&1; then
+                if [ "${DRY_RUN}" = "true" ]; then
+                  echo "[dry-run] would remove release ${tag} (no shipped images remain)"
+                else
+                  gh release delete "$tag" --yes --cleanup-tag
+                  echo "Removed release ${tag}: no shipped images remain (graduated or moved on)"
+                fi
+              fi
+              return 0
+            fi
+            local ver="${tag#go}"
+            ver="${ver%-fips}"
+            local notes sbom_dir
             notes=$(mktemp /tmp/notes.XXXXXX.md)
             {
-              echo "Images for \`quay.io/konveyor/builder\` built with Go ${version}."
+              if [ "$kind" = "pre" ]; then
+                echo "Pre-release FIPS images for \`quay.io/konveyor/builder\` built with Go ${ver} from a **pre-release** [golang-fips](https://github.com/golang-fips/go/releases) tag."
+                echo "They graduate into the \`${tag%-fips}\` release once golang-fips marks this Go version stable."
+              else
+                echo "Images for \`quay.io/konveyor/builder\` built with Go ${ver}."
+              fi
               echo
               echo "| Variant | Tag | Digest |"
               echo "| --- | --- | --- |"
               while IFS=$'\t' read -r _ f d t; do
+              [ -n "$f" ] || continue # entries carry a trailing newline
                 echo "| ${f} | \`${t}\` | \`${d}\` |"
               done <<< "$entries"
               echo
               echo "SBOMs for each image and platform (${PLATFORMS// /, }) are attached to this release. Attestations: https://github.com/konveyor/builder/attestations"
+              if [ "$kind" != "pre" ] && [ -n "$crossref" ]; then
+                echo
+                echo "Pre-release FIPS images for this version are published separately in the [${crossref}](https://github.com/konveyor/builder/releases/tag/${crossref}) release."
+              fi
             } > "$notes"
 
             sbom_dir=$(mktemp -d /tmp/sboms.XXXXXX)
-
             if [ "${DRY_RUN}" = "true" ]; then
-              echo "[dry-run] would create or reconcile release ${release_tag} with $(wc -l <<< "$entries") images"
+              echo "[dry-run] would create or reconcile release ${tag} with $(grep -c . <<< "$entries") images"
               cat "$notes"
-            elif gh release view "$release_tag" >/dev/null 2>&1; then
-              # Reconcile: a variant published after this release was created
-              # must still land in its notes and SBOMs. Notes are regenerated
-              # (idempotent), only missing SBOM assets are scanned+uploaded
-              # (digest-named, so a rebuilt image rescans), and SBOM assets
-              # that no longer match the shipped set are pruned.
+            elif gh release view "$tag" >/dev/null 2>&1; then
+              local expected existing
               expected=$(mktemp /tmp/expected.XXXXXX)
               expected_assets "$entries" > "$expected"
               existing="${sbom_dir}/existing"
-              gh release view "$release_tag" --json assets -q '.assets[].name' > "$existing" || : > "$existing"
+              gh release view "$tag" --json assets -q '.assets[].name' > "$existing" || : > "$existing"
               make_sboms "$entries" "$sbom_dir" "$existing"
-              gh release edit "$release_tag" --notes-file "$notes" >/dev/null
+              # keep the GitHub pre-release flag in step with the bucket:
+              # a release created before this split (or flipped manually)
+              # must not keep advertising the wrong status
+              if [ "$kind" = "pre" ]; then
+                gh release edit "$tag" --prerelease=true --notes-file "$notes" >/dev/null
+              else
+                gh release edit "$tag" --prerelease=false --notes-file "$notes" >/dev/null
+              fi
               shopt -s nullglob
-              new_assets=("${sbom_dir}"/*.spdx.json)
+              local new_assets=("${sbom_dir}"/*.spdx.json)
               if [ "${#new_assets[@]}" -gt 0 ]; then
-                gh release upload "$release_tag" "${new_assets[@]}"
+                gh release upload "$tag" "${new_assets[@]}"
               fi
               while read -r asset; do
                 case "$asset" in
                   *.spdx.json)
                     if ! grep -qx "$asset" "$expected"; then
-                      gh release delete-asset "$release_tag" "$asset" --yes
+                      gh release delete-asset "$tag" "$asset" --yes
                       echo "pruned stale SBOM asset ${asset}"
                     fi
                     ;;
                 esac
               done < "$existing"
               rm -f "$expected"
-              echo "Reconciled release ${release_tag}"
+              echo "Reconciled release ${tag}"
             else
               make_sboms "$entries" "$sbom_dir" ""
-              gh release create "$release_tag" --title "Go ${version} images" \
+              # shellcheck disable=SC2086 # preflag is empty or a single flag
+              gh release create "$tag" $preflag --title "$title" \
                 --notes-file "$notes" "${sbom_dir}"/*.spdx.json
-              echo "Created release ${release_tag}"
+              echo "Created release ${tag}"
             fi
             rm -rf "$notes" "$sbom_dir"
+          }
+
+          while IFS=$'\t' read -r version _ _ _; do
+            # Split the shipped images of this version: FIPS images whose
+            # go-fips source is still a pre-release go into their own FIPS
+            # pre-release release; everything else (standard variants and
+            # stable-sourced FIPS) is stable.
+            stable_entries=""
+            pre_entries=""
+            while IFS=$'\t' read -r ver fam d t lm; do
+              # printf -v: command substitution would strip the trailing
+              # newline and concatenate entries into one line
+              printf -v line '%s\t%s\t%s\t%s' "$ver" "$fam" "$d" "$t"
+              if [[ "$fam" == *-fips ]]; then
+                case "$(fips_pre "$ver" "$lm" "$d")" in
+                  true)  pre_entries+="${line}"$'\n' ;;
+                  false) stable_entries+="${line}"$'\n' ;;
+                  *)
+                    echo "ERROR: no golang-fips release matches published FIPS version ${ver}; refusing to classify it stable"
+                    exit 1
+                    ;;
+                esac
+              else
+                stable_entries+="${line}"$'\n'
+              fi
+            done < <(awk -F'\t' -v v="$version" '$1 == v' /tmp/shipped.tsv)
+
+            # The pre-release release is removed only by graduation —
+            # its FIPS images moving into this version's stable set. When
+            # the FIPS families simply advance past this version, an
+            # existing -fips release stays as a historical record (its
+            # images remain published on quay), so it is neither created
+            # nor deleted here. On graduation the stable release
+            # reconciles first: the pre-release release and its SBOMs are
+            # deleted only after the graduated content actually landed.
+            if [ -n "$pre_entries" ]; then
+              publish_release "go${version}-fips" "Go ${version} FIPS images (pre-release)" \
+                "$pre_entries" "--prerelease" "pre"
+              publish_release "go${version}" "Go ${version} images" \
+                "$stable_entries" "" "stable" "go${version}-fips"
+            else
+              publish_release "go${version}" "Go ${version} images" \
+                "$stable_entries" "" "stable" ""
+              if grep -q -- '-fips' <<< "$stable_entries"; then
+                publish_release "go${version}-fips" "Go ${version} FIPS images (pre-release)" \
+                  "" "--prerelease" "pre"
+              fi
+            fi
+
           done < <(cut -f1 /tmp/shipped.tsv | sort -u)
+
 
           echo "Releases up to date."

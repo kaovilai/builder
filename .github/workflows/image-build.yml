@@ -188,7 +188,17 @@ jobs:
         env:
           # matrix fields reach scripts via env, never shell interpolation
           VERSION_SAFE_INPUT: ${{ matrix.version_safe }}
+          FLAVOR_INPUT: ${{ inputs.flavor }}
+          BUILD_ARG_INPUT: ${{ matrix.build_arg }}
         run: |
+          # record the exact go-fips source tag for the image label below
+          # — badges and releases read it back to classify the built image
+          # by what it was actually built from rather than by push timing
+          if [ "$FLAVOR_INPUT" = "fips" ]; then
+            echo "FIPS_SOURCE_TAG=${BUILD_ARG_INPUT#FIPS_TAG=}" >> $GITHUB_ENV
+          else
+            echo "FIPS_SOURCE_TAG=" >> $GITHUB_ENV
+          fi
           platform=${{ matrix.platform }}
           echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
           echo "VERSION_SAFE=$VERSION_SAFE_INPUT" >> $GITHUB_ENV
@@ -232,6 +242,8 @@ jobs:
           cache-from: type=gha,scope=${{ env.CACHE_SCOPE }}-${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,mode=max,scope=${{ env.CACHE_SCOPE }}-${{ env.PLATFORM_PAIR }}
           provenance: false
+          labels: |
+            io.konveyor.builder.go-fips-source=${{ env.FIPS_SOURCE_TAG }}
           build-args: |
             UBI_MAJOR=${{ inputs.ubi }}
             ${{ matrix.build_arg }}
