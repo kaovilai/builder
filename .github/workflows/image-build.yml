@@ -96,31 +96,35 @@ jobs:
                 map({
                   build_arg: ("FIPS_TAG=" + .value.tag),
                   version_safe: (.value.tag | gsub("/"; "-")),
-                  tag_suffix: (if .key == 0 then "" else (.value.tag | split("-")[0] | ltrimstr("go")) end)
+                  tag_suffix: (if .key == 0 then "" else (.value.tag | split("-")[0] | ltrimstr("go")) end),
+                  pre: .value.pre
                 }) |
                 {include: .}
               ')
             else
               if [ -n "$INPUT_VERSION" ]; then
                 # Find matching FIPS tag for provided Go version
-                fips_tag=$(echo "$fips_releases" | jq -r --arg v "go${INPUT_VERSION}" "${JQ_FIPS}"'
-                  cands | map(select(.tag | startswith($v + "-"))) | best | .tag // empty
+                fips_sel=$(echo "$fips_releases" | jq -r --arg v "go${INPUT_VERSION}" "${JQ_FIPS}"'
+                  cands | map(select(.tag | startswith($v + "-"))) | best | "\(.tag) \(.pre)"
                 ')
+                fips_tag=$(cut -d' ' -f1 <<< "$fips_sel")
+                fips_pre=$(cut -d' ' -f2 <<< "$fips_sel")
                 if [ -z "$fips_tag" ] || [ "$fips_tag" = "null" ]; then
                   echo "ERROR: No golang-fips release found for go${INPUT_VERSION}"
                   exit 1
                 fi
-                matrix=$(jq -nc --arg t "$fips_tag" --arg s "$INPUT_VERSION" \
-                  '{include: [{build_arg: ("FIPS_TAG=" + $t), version_safe: ($t | gsub("/"; "-")), tag_suffix: $s}]}')
+                matrix=$(jq -nc --arg t "$fips_tag" --arg s "$INPUT_VERSION" --argjson p "${fips_pre:-false}" \
+                  '{include: [{build_arg: ("FIPS_TAG=" + $t), version_safe: ($t | gsub("/"; "-")), tag_suffix: $s, pre: $p}]}')
               else
                 # Empty input = latest (best release of the newest minor)
                 fips_tag=$(top2 | jq -r '.[0].tag')
+                fips_pre=$(top2 | jq -r '.[0].pre')
                 if [ -z "$fips_tag" ] || [ "$fips_tag" = "null" ]; then
                   echo "ERROR: No golang-fips releases matched the candidate filter"
                   exit 1
                 fi
-                matrix=$(jq -nc --arg t "$fips_tag" \
-                  '{include: [{build_arg: ("FIPS_TAG=" + $t), version_safe: ($t | gsub("/"; "-")), tag_suffix: ""}]}')
+                matrix=$(jq -nc --arg t "$fips_tag" --argjson p "${fips_pre:-false}" \
+                  '{include: [{build_arg: ("FIPS_TAG=" + $t), version_safe: ($t | gsub("/"; "-")), tag_suffix: "", pre: $p}]}')
               fi
             fi
           else
@@ -419,8 +423,18 @@ jobs:
           FLAVOR: ${{ inputs.flavor }}
           # matrix fields reach scripts via env, never shell interpolation
           VERSION_SAFE_INPUT: ${{ matrix.version_safe }}
+          PRE_SOURCE_INPUT: ${{ matrix.pre }}
         run: |
           echo "VERSION_SAFE=$VERSION_SAFE_INPUT" >> $GITHUB_ENV
+          echo "PRE_SOURCE=${PRE_SOURCE_INPUT:-false}" >> $GITHUB_ENV
+          # a pre-release-sourced build publishes ONLY -pre tags: plain
+          # tags must not exist for pre-release content at all
+          # ($GITHUB_ENV only reaches later steps — read the input here)
+          if [ "${PRE_SOURCE_INPUT:-false}" = "true" ]; then
+            echo "TAG_KIND=-pre" >> $GITHUB_ENV
+          else
+            echo "TAG_KIND=" >> $GITHUB_ENV
+          fi
           case "${FLAVOR}:${UBI}" in
             standard:8) prefix="" ;;
             standard:*) prefix="ubi${UBI}-" ;;
@@ -477,7 +491,7 @@ jobs:
         run: |
           docker buildx imagetools create \
             ${{ github.event_name == 'pull_request' && '--dry-run' || '' }} \
-            -t quay.io/konveyor/builder:${PREFIX}latest${TAG_SUFFIX} \
+            -t quay.io/konveyor/builder:${PREFIX}latest${TAG_SUFFIX}${TAG_KIND} \
             $(printf 'quay.io/konveyor/builder@sha256:%s ' $(ls /tmp/digests))
 
       - name: get multi-arch manifest digest...
@@ -485,7 +499,7 @@ jobs:
         env:
           TAG_SUFFIX: ${{ matrix.tag_suffix }}
         run: |
-          digest=$(docker buildx imagetools inspect "quay.io/konveyor/builder:${PREFIX}latest${TAG_SUFFIX}" --format '{{.Manifest.Digest}}')
+          digest=$(docker buildx imagetools inspect "quay.io/konveyor/builder:${PREFIX}latest${TAG_SUFFIX}${TAG_KIND}" --format '{{.Manifest.Digest}}')
           echo "MANIFEST_DIGEST=$digest" >> $GITHUB_ENV
 
       - name: get go version
@@ -509,10 +523,46 @@ jobs:
 
       - name: create and push versioned multi-arch manifest...
         if: github.event_name != 'pull_request'
+        env:
+          # matrix fields reach scripts via env, never shell interpolation
+          TAG_SUFFIX: ${{ matrix.tag_suffix }}
+          QUAY_ROBOT: ${{ secrets.QUAY_PUBLISH_ROBOT }}
+          QUAY_TOKEN_API: ${{ secrets.QUAY_PUBLISH_TOKEN }}
         run: |
+          # Keep quay honest about pre-release content: a pre-release
+          # build publishes only -pre tags and a stable build only plain
+          # tags, and each prunes the opposite-kind PATCH tag for this
+          # version so the two can never advertise the same content.
+          # Only the patch tag is pruned: the moving aliases (v<minor>,
+          # latest[-<version>]) legitimately serve different content per
+          # kind — plain ones keep pointing at the newest stable build,
+          # -pre ones at the newest pre-release build — so deleting the
+          # opposite kind there could remove a valid stable alias.
+          prune_opposite_kind() { # $1 = tag name of the opposite kind
+            local code
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -u "${QUAY_ROBOT}:${QUAY_TOKEN_API}" \
+              -X DELETE "https://quay.io/api/v1/repository/konveyor/builder/tag/$1")
+            case "$code" in
+              200|204) echo "removed stale tag $1" ;;
+              404) ;; # never existed
+              *)
+                # an unverified cleanup would leave both kinds advertising
+                # the same content — refuse to publish
+                echo "ERROR: removing $1 returned HTTP ${code}"
+                exit 1
+                ;;
+            esac
+          }
+          if [ "$TAG_KIND" = "-pre" ]; then
+            opposite=""
+          else
+            opposite="-pre"
+          fi
+          prune_opposite_kind "${PREFIX}v${{ env.patch_version }}${opposite}"
           docker buildx imagetools create \
-            -t quay.io/konveyor/builder:${PREFIX}v${{ env.minor_version }} \
-            -t quay.io/konveyor/builder:${PREFIX}v${{ env.patch_version }} \
+            -t quay.io/konveyor/builder:${PREFIX}v${{ env.minor_version }}${TAG_KIND} \
+            -t quay.io/konveyor/builder:${PREFIX}v${{ env.patch_version }}${TAG_KIND} \
             $(printf 'quay.io/konveyor/builder@sha256:%s ' $(ls /tmp/digests))
 
       - name: verify the published artifact...
@@ -525,8 +575,10 @@ jobs:
         run: |
           set -euo pipefail
           img=quay.io/konveyor/builder
-          patch_tag="${PREFIX}v${patch_version}"
-          minor_tag="${PREFIX}v${minor_version}"
+          # the kind this build published (plain or -pre) — every
+          # inspection below must use it
+          patch_tag="${PREFIX}v${patch_version}${TAG_KIND}"
+          minor_tag="${PREFIX}v${minor_version}${TAG_KIND}"
 
           manifest_digest=$(docker buildx imagetools inspect "${img}:${patch_tag}" --format '{{.Manifest.Digest}}')
           platforms=$(docker buildx imagetools inspect "${img}:${patch_tag}" \
@@ -536,7 +588,8 @@ jobs:
               || { echo "ERROR: $p missing from ${img}:${patch_tag} (platforms: $platforms)"; exit 1; }
           done
 
-          for tag in "$minor_tag" "$patch_tag"; do
+          tags_to_check=("$minor_tag" "$patch_tag")
+          for tag in "${tags_to_check[@]}"; do
             d=$(docker buildx imagetools inspect "${img}:${tag}" --format '{{.Manifest.Digest}}')
             [ "$d" = "$manifest_digest" ] \
               || { echo "ERROR: ${img}:${tag} resolves to $d, expected $manifest_digest"; exit 1; }

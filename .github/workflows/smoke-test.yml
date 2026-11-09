@@ -70,7 +70,10 @@ jobs:
           for digest, names in by_digest.items():
               versions = set()
               for n in names:
-                  for m in re.finditer(r"v(\d+)\.(\d+)\.(\d+)", n):
+                  # anchored with an optional -pre suffix: pre-release
+                  # content publishes only -pre tags, stable only plain
+                  m = re.search(r"v(\d+)\.(\d+)\.(\d+)(-pre)?$", n)
+                  if m:
                       versions.add((int(m[1]), int(m[2]), int(m[3])))
               fams[family(names[0])].append({"digest": digest, "tags": names, "versions": versions})
 
@@ -86,7 +89,7 @@ jobs:
                   if best:
                       v, e = best
                       suffix = "v%d.%d.%d" % v
-                      tag = next(n for n in e["tags"] if n.endswith(suffix))
+                      tag = next(n for n in e["tags"] if n.endswith(suffix) or n.endswith(suffix + "-pre"))
                       version = "%d.%d.%d" % v
                       include.append({
                           "image": f"quay.io/konveyor/builder:{tag}",

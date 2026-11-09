@@ -157,16 +157,22 @@ jobs:
             def best: max_by([ (if .pre then 0 else 1 end), vkey, bkey, ossl ]);
             cands | group_by(vkey | .[0:2]) | sort_by(.[0] | vkey | .[0:2]) | reverse
             | .[0:2] | map(best)
-            | to_entries[] | "\(.key) \(.value.tag | split("-")[0] | ltrimstr("go"))"
+            | to_entries[] | "\(.key) \(.value.pre) \(.value.tag | split("-")[0] | ltrimstr("go"))"
           ')
 
           for entry in "${FIPS_ENTRIES[@]}"; do
             idx="${entry%% *}"
-            ver="${entry#* }"
+            rest="${entry#* }"
+            pre="${rest%% *}"
+            ver="${rest#* }"
             if [ "$idx" -eq 0 ]; then input=""; else input="$ver"; fi
+            # the expected tag carries the source's kind: pre-release
+            # sources publish only -pre tags, and a source that went
+            # stable must rebuild to publish the plain tags
+            if [ "$pre" = "true" ]; then kind="-pre"; else kind=""; fi
             while read -r ubi flavor; do
               [ "$flavor" = "fips" ] || continue
-              expected="$(variant_prefix "$ubi" "$flavor")v${ver}"
+              expected="$(variant_prefix "$ubi" "$flavor")v${ver}${kind}"
               if tag_published "$expected"; then
                 echo "[ubi${ubi}-fips] $expected already published, skipping"
               else

@@ -59,7 +59,7 @@ jobs:
             while :; do
               resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
                 "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
-              echo "$resp" | jq -r '.tags[] | "\(.name) \(.manifest_digest)"' | grep -v godev
+              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | "\(.name) \(.manifest_digest)"'
               [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
               page=$((page + 1))
             done
@@ -88,7 +88,10 @@ jobs:
           for digest, names in by_digest.items():
               versions = set()
               for n in names:
-                  for m in re.finditer(r"v(\d+)\.(\d+)\.(\d+)", n):
+                  # anchored with an optional -pre suffix: pre-release
+                  # content publishes only -pre tags, stable only plain
+                  m = re.search(r"v(\d+)\.(\d+)\.(\d+)(-pre)?$", n)
+                  if m:
                       versions.add((int(m[1]), int(m[2]), int(m[3])))
               fams[family(names[0])].append({"digest": digest, "tags": names, "versions": versions})
 
@@ -107,7 +110,7 @@ jobs:
           include = []
           for digest, (v, e) in selected.items():
               suffix = "v%d.%d.%d" % v
-              tag = next(n for n in e["tags"] if n.endswith(suffix))
+              tag = next(n for n in e["tags"] if n.endswith(suffix) or n.endswith(suffix + "-pre"))
               # correlator is stable per variant slot (major.minor): a new
               # patch of the same minor replaces the slot's previous snapshot
               # instead of opening a new stream that accumulates forever

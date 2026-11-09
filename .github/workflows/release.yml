@@ -86,7 +86,10 @@ jobs:
           for digest, names in by_digest.items():
               versions = set()
               for n in names:
-                  for m in re.finditer(r"v(\d+)\.(\d+)\.(\d+)", n):
+                  # anchored with an optional -pre suffix: pre-release
+                  # content publishes only -pre tags, stable only plain
+                  m = re.search(r"v(\d+)\.(\d+)\.(\d+)(-pre)?$", n)
+                  if m:
                       versions.add((int(m[1]), int(m[2]), int(m[3])))
               fams[family(names[0])].append({"digest": digest, "tags": names, "versions": versions})
 
@@ -103,7 +106,7 @@ jobs:
                   if best:
                       v, e = best
                       suffix = "v%d.%d.%d" % v
-                      tag = next(n for n in e["tags"] if n.endswith(suffix))
+                      tag = next(n for n in e["tags"] if n.endswith(suffix) or n.endswith(suffix + "-pre"))
                       releases["%d.%d.%d" % v].append((key, e["digest"], v, tag))
 
           for version in sorted(releases):
@@ -305,12 +308,21 @@ jobs:
               # newline and concatenate entries into one line
               printf -v line '%s\t%s\t%s\t%s' "$ver" "$fam" "$d" "$t"
               if [[ "$fam" == *-fips ]]; then
-                case "$(fips_pre "$ver" "$lm" "$d")" in
-                  true)  pre_entries+="${line}"$'\n' ;;
-                  false) stable_entries+="${line}"$'\n' ;;
+                case "$t" in
+                  # pre-release content publishes only -pre tags — the
+                  # suffix is the classification
+                  *-pre) pre_entries+="${line}"$'\n' ;;
+                  # plain tags: classify by the recorded source (label)
+                  # or, for pre-label images, by push timing
                   *)
-                    echo "ERROR: no golang-fips release matches published FIPS version ${ver}; refusing to classify it stable"
-                    exit 1
+                    case "$(fips_pre "$ver" "$lm" "$d")" in
+                      true)  pre_entries+="${line}"$'\n' ;;
+                      false) stable_entries+="${line}"$'\n' ;;
+                      *)
+                        echo "ERROR: no golang-fips release matches published FIPS version ${ver}; refusing to classify it stable"
+                        exit 1
+                        ;;
+                    esac
                     ;;
                 esac
               else
