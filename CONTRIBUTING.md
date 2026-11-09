@@ -13,7 +13,7 @@ Current single owners:
 
 | Rule | Owner |
 | ---- | ----- |
-| Shipped-image selection — quay tags grouped by digest, per variant family the newest patch of the two newest minor versions, `-pre`-aware | `scripts/shipped-set.sh` (`--raw` emits every active tag) |
+| Shipped-image selection — quay tags grouped by digest, per variant family the newest patch of the two newest minor versions, `-pre`-aware | `scripts/shipped-set.sh` (`--raw` emits every active tag; both modes exclude names containing `godev`) |
 | Image tag naming and publishing — `<prefix>v<version>[-pre]`, `latest[<version>][-pre]` (the version segment is not hyphenated, e.g. `latest1.27.3-pre`); pre-release sources publish only `-pre` tags, stable only plain, each build prunes the opposite-kind patch tag | `.github/workflows/image-build.yml` (build-time publishing) and `.github/workflows/ubi-drift-check.yml` (drift-time re-pointing of the canonical latest aliases) — the only two workflows that write to the registry |
 | Variant registry — which UBI majors and flavors ship | `variants.txt` (workflows enumerate it; adding a variant is adding a line) |
 
