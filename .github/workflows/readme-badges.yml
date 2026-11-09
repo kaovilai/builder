@@ -110,12 +110,17 @@ jobs:
                 suffix=""; color=orange
               else
                 # plain tags: classify by the recorded source (label) or,
-                # for pre-label images, by push timing
+                # for pre-label images, by push timing. A version with no
+                # matching golang-fips release (upstream deleted it) gets a
+                # grey "unknown" badge rather than aborting the refresh —
+                # one stale row must not freeze every variant's badges —
+                # but it is never silently labeled stable
                 case "$(scripts/fips-classify.sh /tmp/fips-releases.json "$ver" "$ts" "$digest")" in
                   true)    suffix="_pre--release"; color=orange ;;
                   false)   suffix=""; color=blueviolet ;;
+                  unknown) suffix="_unknown"; color=lightgrey ;;
                   *)
-                    echo "ERROR: no golang-fips release matches published FIPS version ${ver}; refusing to mark it stable"
+                    echo "ERROR: unexpected classification for published FIPS version ${ver}"
                     exit 1
                     ;;
                 esac
