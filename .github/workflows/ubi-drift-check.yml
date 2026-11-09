@@ -219,19 +219,23 @@ jobs:
           if [ -n "${drifted}" ] || [ -s "$retry_targets" ]; then
             # Every currently-shipped version of the affected variants,
             # from the shared selector: filter to the drifted majors and
-            # remap to major/flavor/version/tag, the newest minor
-            # dispatching as LATEST (build latest), matching the
-            # dispatcher's convention. Unpublished retry targets from
-            # the confirmation above are prepended verbatim (retry only
-            # what failed, not the whole family) and deduped against
-            # fresh drift dispatches.
+            # remap to major/flavor/version/tag. Every dispatch carries
+            # the selected concrete version — an empty go_version (build
+            # latest) could build a newer upstream release than the
+            # selected tag if upstream moved mid-flight, leaving the
+            # selected image unpublished and the round pending. The
+            # moving latest aliases are refreshed by this workflow's own
+            # re-point logic after confirmation, not by these builds.
+            # Unpublished retry targets from the confirmation above are
+            # prepended verbatim (retry only what failed, not the whole
+            # family) and deduped against fresh drift dispatches.
             [ -f /tmp/tags.txt ] || scripts/shipped-set.sh --raw > /tmp/tags.txt
             selector_out=$(scripts/shipped-set.sh \
               | awk -F'\t' -v want="${drifted}" \
                   'BEGIN { n = split(want, w, " "); for (i = 1; i <= n; i++) wanted[w[i]] = 1 }
                    # space-separated to match the retry-target format, so
                    # the dedup below sees one form of each target
-                   wanted[$2] { print $2, $3, ($8 == 1 ? "LATEST" : $1), $6 }')
+                   wanted[$2] { print $2, $3, $1, $6 }')
             # dedupe on major/flavor/tag, not the version field: a
             # newest-minor retry carries an explicit version while a
             # fresh drift selection for the same tag carries LATEST —
@@ -242,11 +246,6 @@ jobs:
             : > /tmp/dispatched.txt
             while read -r major flavor version tag; do
               [ -n "$major" ] || continue
-              # the newest minor dispatches with an empty go_version
-              # (build latest), matching the dispatcher's convention
-              # (an if, not &&-and: the bare compound would fail the
-              # loop under set -e for every non-LATEST target)
-              if [ "$version" = "LATEST" ]; then version=""; fi
               if [ "${DRY_RUN}" = "true" ]; then
                 echo "  [dry-run] would dispatch build.yml (ubi=${major} flavor=${flavor} go_version='${version}')"
               elif [ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
