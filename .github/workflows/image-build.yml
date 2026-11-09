@@ -427,6 +427,13 @@ jobs:
         run: |
           echo "VERSION_SAFE=$VERSION_SAFE_INPUT" >> $GITHUB_ENV
           echo "PRE_SOURCE=${PRE_SOURCE_INPUT:-false}" >> $GITHUB_ENV
+          # a pre-release-sourced build publishes ONLY -pre tags: plain
+          # tags must not exist for pre-release content at all
+          if [ "$PRE_SOURCE" = "true" ]; then
+            echo "TAG_KIND=-pre" >> $GITHUB_ENV
+          else
+            echo "TAG_KIND=" >> $GITHUB_ENV
+          fi
           case "${FLAVOR}:${UBI}" in
             standard:8) prefix="" ;;
             standard:*) prefix="ubi${UBI}-" ;;
@@ -483,7 +490,7 @@ jobs:
         run: |
           docker buildx imagetools create \
             ${{ github.event_name == 'pull_request' && '--dry-run' || '' }} \
-            -t quay.io/konveyor/builder:${PREFIX}latest${TAG_SUFFIX} \
+            -t quay.io/konveyor/builder:${PREFIX}latest${TAG_SUFFIX}${TAG_KIND} \
             $(printf 'quay.io/konveyor/builder@sha256:%s ' $(ls /tmp/digests))
 
       - name: get multi-arch manifest digest...
@@ -491,7 +498,7 @@ jobs:
         env:
           TAG_SUFFIX: ${{ matrix.tag_suffix }}
         run: |
-          digest=$(docker buildx imagetools inspect "quay.io/konveyor/builder:${PREFIX}latest${TAG_SUFFIX}" --format '{{.Manifest.Digest}}')
+          digest=$(docker buildx imagetools inspect "quay.io/konveyor/builder:${PREFIX}latest${TAG_SUFFIX}${TAG_KIND}" --format '{{.Manifest.Digest}}')
           echo "MANIFEST_DIGEST=$digest" >> $GITHUB_ENV
 
       - name: get go version
@@ -515,18 +522,41 @@ jobs:
 
       - name: create and push versioned multi-arch manifest...
         if: github.event_name != 'pull_request'
+        env:
+          # matrix fields reach scripts via env, never shell interpolation
+          TAG_SUFFIX: ${{ matrix.tag_suffix }}
+          QUAY_ROBOT: ${{ secrets.QUAY_PUBLISH_ROBOT }}
+          QUAY_TOKEN_API: ${{ secrets.QUAY_PUBLISH_TOKEN }}
         run: |
-          extra_tags=""
-          if [ "$PRE_SOURCE" = "true" ]; then
-            # the go-fips source for this build is a pre-release: alias the
-            # patch tag with a -pre suffix so quay consumers can tell
-            # pre-release-built images from stable ones at the tag itself
-            extra_tags="-t quay.io/konveyor/builder:${PREFIX}v${{ env.patch_version }}-pre"
+          # Keep quay honest about pre-release content: a pre-release
+          # build publishes only -pre tags and a stable build only plain
+          # tags, and each prunes the opposite kind for this version so
+          # the two can never advertise the same content.
+          prune_opposite_kind() { # $@ = tag names of the opposite kind
+            local tag code
+            for tag in "$@"; do
+              code=$(curl -sS -o /dev/null -w '%{http_code}' \
+                -u "${QUAY_ROBOT}:${QUAY_TOKEN_API}" \
+                -X DELETE "https://quay.io/api/v1/repository/konveyor/builder/tag/${tag}")
+              case "$code" in
+                200|204) echo "removed stale tag ${tag}" ;;
+                404) ;; # never existed
+                *) echo "WARNING: removing ${tag} returned HTTP ${code}" ;;
+              esac
+            done
+          }
+          if [ "$TAG_KIND" = "-pre" ]; then
+            opposite=""
+          else
+            opposite="-pre"
           fi
+          prune_opposite_kind \
+            "${PREFIX}latest${TAG_SUFFIX}${opposite}" \
+            "${PREFIX}v${{ env.minor_version }}${opposite}" \
+            "${PREFIX}v${{ env.patch_version }}${opposite}"
           docker buildx imagetools create \
-            -t quay.io/konveyor/builder:${PREFIX}v${{ env.minor_version }} \
-            -t quay.io/konveyor/builder:${PREFIX}v${{ env.patch_version }} \
-            $extra_tags \
+            -t quay.io/konveyor/builder:${PREFIX}v${{ env.minor_version }}${TAG_KIND} \
+            -t quay.io/konveyor/builder:${PREFIX}v${{ env.patch_version }}${TAG_KIND} \
             $(printf 'quay.io/konveyor/builder@sha256:%s ' $(ls /tmp/digests))
 
       - name: verify the published artifact...
@@ -550,8 +580,9 @@ jobs:
               || { echo "ERROR: $p missing from ${img}:${patch_tag} (platforms: $platforms)"; exit 1; }
           done
 
+          minor_tag="${minor_tag}${TAG_KIND}"
+          patch_tag="${patch_tag}${TAG_KIND}"
           tags_to_check=("$minor_tag" "$patch_tag")
-          [ "$PRE_SOURCE" = "true" ] && tags_to_check+=("${patch_tag}-pre")
           for tag in "${tags_to_check[@]}"; do
             d=$(docker buildx imagetools inspect "${img}:${tag}" --format '{{.Manifest.Digest}}')
             [ "$d" = "$manifest_digest" ] \

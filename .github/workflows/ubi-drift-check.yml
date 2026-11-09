@@ -102,7 +102,7 @@ jobs:
                 "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
               # godev filtered in jq: a page holding only godev tags would
               # make grep exit 1 and abort the run
-              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | select((.name | endswith("-pre")) | not) | "\(.name) \(.manifest_digest) \(.last_modified)"'
+              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | "\(.name) \(.manifest_digest) \(.last_modified)"'
               [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
               page=$((page + 1))
             done
@@ -185,7 +185,7 @@ jobs:
                     *openssl-fips*) flavor="fips" ;;
                     *) flavor="standard" ;;
                   esac
-                  version=$(sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+)$/\1/' <<< "$tag")
+                  version=$(sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+)(-pre)?$/\1/' <<< "$tag")
                   printf '%s %s %s %s\n' "$major" "$flavor" "$version" "$tag" >> "$retry_targets"
                 done
               fi
@@ -245,11 +245,9 @@ jobs:
           for digest, names in by_digest.items():
               versions = set()
               for n in names:
-                  # anchored: only a trailing plain vX.Y.Z counts as the
-                  # tag's version, so a digest left with only a -pre
-                  # alias contributes no versions and can never win a
-                  # version tie (the lookup requires the plain suffix)
-                  m = re.search(r"v(\d+)\.(\d+)\.(\d+)$", n)
+                  # anchored with an optional -pre suffix: pre-release
+                  # content publishes only -pre tags, stable only plain
+                  m = re.search(r"v(\d+)\.(\d+)\.(\d+)(-pre)?$", n)
                   if m:
                       versions.add((int(m[1]), int(m[2]), int(m[3])))
               fams[family(names[0])].append({"digest": digest, "tags": names, "versions": versions})
@@ -274,7 +272,7 @@ jobs:
                       # upstream has moved past it. New upstream versions
                       # are the scheduled dispatcher's job, not this check's.
                       suffix = "v%d.%d.%d" % v
-                      tag = next(n for n in e["tags"] if n.endswith(suffix))
+                      tag = next(n for n in e["tags"] if n.endswith(suffix) or n.endswith(suffix + "-pre"))
                       print("%s %s %d.%d.%d %s" % (major, flavor, v[0], v[1], v[2], tag))
           PYEOF
             )
@@ -311,16 +309,19 @@ jobs:
                   *:standard) prefix="ubi${major}-" ;;
                   *)          prefix="ubi${major}-openssl-fips-" ;;
                 esac
-                alias="${prefix}latest"
-                lat_d=$(awk -v t="$alias" '$1 == t {print $2; exit}' /tmp/tags.txt)
-                [ -n "$lat_d" ] || continue
-                while read -r t; do
-                  if [ "$(awk -v x="$t" '$1 == x {print $2; exit}' /tmp/tags.txt)" = "$lat_d" ]; then
-                    latest_json=$(jq -c --arg a "$alias" --arg w "$lat_d" --arg o "$t" \
-                      '. + [{alias: $a, was: $w, of: $o}]' <<< "$latest_json")
-                    break
-                  fi
-                done < <(awk -v m="$major" -v f="$flavor" '$1 == m && $2 == f {print $3}' /tmp/dispatched.txt)
+                # both alias kinds: plain latest backs stable content,
+                # latest-pre backs pre-release content
+                for alias in "${prefix}latest" "${prefix}latest-pre"; do
+                  lat_d=$(awk -v t="$alias" '$1 == t {print $2; exit}' /tmp/tags.txt)
+                  [ -n "$lat_d" ] || continue
+                  while read -r t; do
+                    if [ "$(awk -v x="$t" '$1 == x {print $2; exit}' /tmp/tags.txt)" = "$lat_d" ]; then
+                      latest_json=$(jq -c --arg a "$alias" --arg w "$lat_d" --arg o "$t" \
+                        '. + [{alias: $a, was: $w, of: $o}]' <<< "$latest_json")
+                      break
+                    fi
+                  done < <(awk -v m="$major" -v f="$flavor" '$1 == m && $2 == f {print $3}' /tmp/dispatched.txt)
+                done
               done < <(awk -v m="$major" '$1 == m {print $2}' /tmp/dispatched.txt | sort -u)
               now=$(jq -r --arg m "$major" '.[$m]' <<< "$current")
               # union with the existing pending.latest by alias (new wins):
