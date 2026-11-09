@@ -86,7 +86,12 @@ jobs:
           for digest, names in by_digest.items():
               versions = set()
               for n in names:
-                  for m in re.finditer(r"v(\d+)\.(\d+)\.(\d+)", n):
+                  # anchored: only a trailing plain vX.Y.Z counts as the
+                  # tag's version, so a digest left with only a -pre
+                  # alias contributes no versions and can never win a
+                  # version tie (the lookup requires the plain suffix)
+                  m = re.search(r"v(\d+)\.(\d+)\.(\d+)$", n)
+                  if m:
                       versions.add((int(m[1]), int(m[2]), int(m[3])))
               fams[family(names[0])].append({"digest": digest, "tags": names, "versions": versions})
 
