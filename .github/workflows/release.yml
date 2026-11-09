@@ -129,7 +129,7 @@ jobs:
                 | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
                 | select(.tag_name | startswith("go" + $v + "-"))
                 | {tag: .tag_name, pre: .prerelease, at: .published_at} ]
-              | if length == 0 then false
+              | if length == 0 then "unknown"
                 else ([ .[] | select(.pre == false) | select(.at <= $ts) ] | length) == 0
                 end
             ' <<< "$FIPS_RELEASES"
@@ -226,7 +226,14 @@ jobs:
               existing="${sbom_dir}/existing"
               gh release view "$tag" --json assets -q '.assets[].name' > "$existing" || : > "$existing"
               make_sboms "$entries" "$sbom_dir" "$existing"
-              gh release edit "$tag" --notes-file "$notes" >/dev/null
+              # keep the GitHub pre-release flag in step with the bucket:
+              # a release created before this split (or flipped manually)
+              # must not keep advertising the wrong status
+              if [ "$kind" = "pre" ]; then
+                gh release edit "$tag" --prerelease=true --notes-file "$notes" >/dev/null
+              else
+                gh release edit "$tag" --prerelease=false --notes-file "$notes" >/dev/null
+              fi
               shopt -s nullglob
               local new_assets=("${sbom_dir}"/*.spdx.json)
               if [ "${#new_assets[@]}" -gt 0 ]; then
@@ -265,38 +272,35 @@ jobs:
               # printf -v: command substitution would strip the trailing
               # newline and concatenate entries into one line
               printf -v line '%s\t%s\t%s\t%s' "$ver" "$fam" "$d" "$t"
-              if [[ "$fam" == *-fips ]] && [ "$(fips_pre "$ver" "$lm")" = "true" ]; then
-                pre_entries+="${line}"$'\n'
+              if [[ "$fam" == *-fips ]]; then
+                case "$(fips_pre "$ver" "$lm")" in
+                  true)  pre_entries+="${line}"$'\n' ;;
+                  false) stable_entries+="${line}"$'\n' ;;
+                  *)
+                    echo "ERROR: no golang-fips release matches published FIPS version ${ver}; refusing to classify it stable"
+                    exit 1
+                    ;;
+                esac
               else
                 stable_entries+="${line}"$'\n'
               fi
             done < <(awk -F'\t' -v v="$version" '$1 == v' /tmp/shipped.tsv)
 
-            publish_release "go${version}-fips" "Go ${version} FIPS images (pre-release)" \
-              "$pre_entries" "--prerelease" "pre"
+            # The pre-release release is removed only by graduation —
+            # its FIPS images moving into this version's stable set. When
+            # the FIPS families simply advance past this version, an
+            # existing -fips release stays as a historical record (its
+            # images remain published on quay), so it is neither created
+            # nor deleted here.
+            if [ -n "$pre_entries" ] || grep -q -- '-fips' <<< "$stable_entries"; then
+              publish_release "go${version}-fips" "Go ${version} FIPS images (pre-release)" \
+                "$pre_entries" "--prerelease" "pre"
+            fi
             publish_release "go${version}" "Go ${version} images" \
               "$stable_entries" "" "stable" \
               "$([ -n "$pre_entries" ] && echo "go${version}-fips")"
 
           done < <(cut -f1 /tmp/shipped.tsv | sort -u)
 
-          # Sweep: a version every family has moved past is absent from the
-          # shipped set, so the loop above never visits it and its releases
-          # orphan. Remove those too.
-          while read -r rel; do
-            case "$rel" in
-              go*-fips) ver="${rel#go}"; ver="${ver%-fips}" ;;
-              go*) ver="${rel#go}" ;;
-              *) continue ;;
-            esac
-            if ! awk -F'\t' -v v="$ver" '$1 == v { found = 1 } END { exit !found }' /tmp/shipped.tsv; then
-              if [ "${DRY_RUN}" = "true" ]; then
-                echo "[dry-run] would remove orphaned release ${rel} (version ${ver} ships nothing)"
-              else
-                gh release delete "$rel" --yes --cleanup-tag
-                echo "Removed orphaned release ${rel}: version ${ver} no longer ships any images"
-              fi
-            fi
-          done < <(gh release list --json tagName -q '.[].tagName')
 
           echo "Releases up to date."

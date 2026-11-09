@@ -127,11 +127,14 @@ jobs:
             ver="${line%% *}"
             ts="${line#* }"
             if [ -n "$ver" ]; then
-              if [ "$(fips_pre "$ver" "$ts")" = "true" ]; then
-                suffix="_pre--release"; color=orange
-              else
-                suffix=""; color=blueviolet
-              fi
+              case "$(fips_pre "$ver" "$ts")" in
+                true)    suffix="_pre--release"; color=orange ;;
+                false)   suffix=""; color=blueviolet ;;
+                *)
+                  echo "ERROR: no golang-fips release matches published FIPS version ${ver}; refusing to mark it stable"
+                  exit 1
+                  ;;
+              esac
               echo "[![${1}](https://img.shields.io/badge/${1// /_}-Go_${ver}${suffix}-${color})](https://quay.io/repository/konveyor/builder?tab=tags)"
             fi
           }
