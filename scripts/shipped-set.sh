@@ -40,13 +40,27 @@ published_tags() {
 # of the selected shipped set (the drift check's publish confirmation
 # looks up tags that may have left the shipped set). Like the default
 # mode, names containing "godev" are excluded.
+# --latest-by-kind: per family, the newest published patch tag of EACH
+# kind (a "kind" column, "plain"/"pre", replaces "newest" as the last
+# column; at most one row per family per kind, omitted when that kind
+# has nothing published). The kind filter runs BEFORE any patch/minor
+# reduction: the newest plain patch can be older than the newest -pre
+# patch of the same minor (stable 1.27.2 next to 1.27.3-pre), which the
+# default per-minor selection would discard. Composable with --from.
 # --from <file>: select from a --raw snapshot instead of a fresh crawl,
 # so callers that also use the snapshot directly (the drift check's
 # alias bookkeeping) never see selection and bookkeeping disagree
-if [ "${1:-}" = "--raw" ]; then
-  published_tags
-  exit 0
-fi
+MODE=selection
+case "${1:-}" in
+  --raw)
+    published_tags
+    exit 0
+    ;;
+  --latest-by-kind)
+    MODE=latest-by-kind
+    shift
+    ;;
+esac
 
 # the selector reads the tag list from a file: its script arrives on
 # stdin via the heredoc below, so the tags cannot also be piped in
@@ -58,7 +72,7 @@ else
   published_tags > "$TAGS_FILE"
 fi
 
-python3 - "$TAGS_FILE" <<'PYEOF'
+python3 - "$TAGS_FILE" "$MODE" <<'PYEOF'
 import re
 import sys
 from collections import defaultdict
@@ -86,6 +100,28 @@ for digest, names in by_digest.items():
         if m:
             versions.add((int(m[1]), int(m[2]), int(m[3])))
     fams.setdefault(family(names[0]), []).append({"digest": digest, "tags": names, "versions": versions})
+
+if sys.argv[2] == "latest-by-kind":
+    # kind filtered before any reduction — see the mode docs above
+    for key, entries in fams.items():
+        major = key[len("ubi"):].split("-")[0]
+        flavor = "fips" if key.endswith("-fips") else "standard"
+        for kind, suffix in (("plain", ""), ("pre", "-pre")):
+            best = None
+            for e in entries:
+                for v in e["versions"]:
+                    s = "v%d.%d.%d" % v
+                    tag = next((n for n in e["tags"] if n.endswith(s + suffix)), None)
+                    if tag is None:
+                        continue
+                    if best is None or v > best[0]:
+                        best = (v, e, tag)
+            if best:
+                v, e, tag = best
+                print("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (
+                    "%d.%d.%d" % v, major, flavor, key, e["digest"], tag,
+                    last_modified[tag], kind))
+    sys.exit(0)
 
 for key, entries in fams.items():
     major = key[len("ubi"):].split("-")[0]
