@@ -55,7 +55,7 @@ jobs:
                 "https://quay.io/api/v1/repository/konveyor/builder/tag/?limit=100&page=${page}&onlyActiveTags=true")
               # godev filtered in jq: a page holding only godev tags would
               # make grep exit 1 and abort the run
-              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | "\(.name) \(.manifest_digest)"'
+              echo "$resp" | jq -r '.tags[] | select((.name | contains("godev")) | not) | "\(.name) \(.manifest_digest) \(.last_modified)"'
               [ "$(echo "$resp" | jq -r '.has_additional')" = "true" ] || break
               page=$((page + 1))
             done
@@ -70,9 +70,12 @@ jobs:
           from collections import defaultdict
 
           by_digest = {}
+          last_modified = {}
           for line in open(sys.argv[1]):
-              name, digest = line.split()
+              name, digest, when = line.split(None, 2)
+              when = when.strip()
               by_digest.setdefault(digest, []).append(name)
+              last_modified[name] = when
 
           def family(n):
               fips = "-fips" if "openssl-fips" in n else ""
@@ -105,7 +108,7 @@ jobs:
 
           for version in sorted(releases):
               for family, digest, v, tag in sorted(releases[version]):
-                  print("%s\t%s\t%s\t%s" % (version, family, digest, tag))
+                  print("%s\t%s\t%s\t%s\t%s" % (version, family, digest, tag, last_modified[tag]))
           PYEOF
 
           # golang-fips source releases (same candidate filter and ordering
@@ -114,16 +117,21 @@ jobs:
           # Go version is still marked pre-release — stable and pre-release
           # sources are indistinguishable in the quay tag name alone.
           FIPS_RELEASES="$(gh api repos/golang-fips/go/releases --paginate | jq -s 'add')"
-          fips_pre() {
-            jq -r --arg v "$1" '
+          fips_pre() { # $1 = Go version, $2 = tag last_modified (RFC 1123)
+            # builds always use the best release of the version current at
+            # build time, so the image is pre-release iff no stable release
+            # of that Go version had been published when the tag was last
+            # pushed; "false" when no matching release exists at all
+            local ts_iso
+            ts_iso="$(date -u -d "$2" +%Y-%m-%dT%H:%M:%SZ)"
+            jq -r --arg v "$1" --arg ts "$ts_iso" '
               [ .[] | select(.draft == false)
                 | select(.tag_name | test("^go[0-9]+\\.[0-9]+(\\.[0-9]+)?-[0-9]+-(openssl-fips|hostfips-release)$"))
                 | select(.tag_name | startswith("go" + $v + "-"))
-                | {tag: .tag_name, pre: .prerelease} ]
-              | max_by([(if .pre then 0 else 1 end),
-                        (.tag | split("-")[1] | tonumber),
-                        (if .tag | endswith("openssl-fips") then 1 else 0 end)])
-              | if . == null then "false" elif .pre then "true" else "false" end
+                | {tag: .tag_name, pre: .prerelease, at: .published_at} ]
+              | if length == 0 then false
+                else ([ .[] | select(.pre == false) | select(.at <= $ts) ] | length) == 0
+                end
             ' <<< "$FIPS_RELEASES"
           }
 
@@ -165,7 +173,22 @@ jobs:
           # per-version release had, applied to each release separately.
           publish_release() {
             local tag="$1" title="$2" entries="$3" preflag="$4" kind="$5" crossref="${6:-}"
-            [ -n "$entries" ] || return 0
+            if [ -z "$entries" ]; then
+              # No shipped images remain for this release: the content
+              # either graduated (a pre-release FIPS source went stable
+              # and moved into the stable release) or moved on to a newer
+              # version. An existing release would keep describing
+              # no-longer-shipped images, so remove it.
+              if gh release view "$tag" >/dev/null 2>&1; then
+                if [ "${DRY_RUN}" = "true" ]; then
+                  echo "[dry-run] would remove release ${tag} (no shipped images remain)"
+                else
+                  gh release delete "$tag" --yes --cleanup-tag
+                  echo "Removed release ${tag}: no shipped images remain (graduated or moved on)"
+                fi
+              fi
+              return 0
+            fi
             local ver="${tag#go}"
             ver="${ver%-fips}"
             local notes sbom_dir
@@ -238,40 +261,42 @@ jobs:
             # stable-sourced FIPS) is stable.
             stable_entries=""
             pre_entries=""
-            while IFS=$'\t' read -r ver fam d t; do
+            while IFS=$'\t' read -r ver fam d t lm; do
               # printf -v: command substitution would strip the trailing
               # newline and concatenate entries into one line
               printf -v line '%s\t%s\t%s\t%s' "$ver" "$fam" "$d" "$t"
-              if [[ "$fam" == *-fips ]] && [ "$(fips_pre "$ver")" = "true" ]; then
+              if [[ "$fam" == *-fips ]] && [ "$(fips_pre "$ver" "$lm")" = "true" ]; then
                 pre_entries+="${line}"$'\n'
               else
                 stable_entries+="${line}"$'\n'
               fi
             done < <(awk -F'\t' -v v="$version" '$1 == v' /tmp/shipped.tsv)
 
-            if [ -n "$pre_entries" ]; then
-              publish_release "go${version}-fips" "Go ${version} FIPS images (pre-release)" \
-                "$pre_entries" "--prerelease" "pre"
-              publish_release "go${version}" "Go ${version} images" \
-                "$stable_entries" "" "stable" "go${version}-fips"
-            else
-              publish_release "go${version}" "Go ${version} images" \
-                "$stable_entries" "" "stable" ""
-            fi
+            publish_release "go${version}-fips" "Go ${version} FIPS images (pre-release)" \
+              "$pre_entries" "--prerelease" "pre"
+            publish_release "go${version}" "Go ${version} images" \
+              "$stable_entries" "" "stable" \
+              "$([ -n "$pre_entries" ] && echo "go${version}-fips")"
 
-            # Graduation: once every FIPS image of this version is
-            # stable-sourced, the pre-release release has nothing left to
-            # say — its images now live in the stable release. Delete it
-            # so it cannot keep advertising a pre-release that no longer
-            # exists.
-            if [ -z "$pre_entries" ] && gh release view "go${version}-fips" >/dev/null 2>&1; then
+          done < <(cut -f1 /tmp/shipped.tsv | sort -u)
+
+          # Sweep: a version every family has moved past is absent from the
+          # shipped set, so the loop above never visits it and its releases
+          # orphan. Remove those too.
+          while read -r rel; do
+            case "$rel" in
+              go*-fips) ver="${rel#go}"; ver="${ver%-fips}" ;;
+              go*) ver="${rel#go}" ;;
+              *) continue ;;
+            esac
+            if ! awk -F'\t' -v v="$ver" '$1 == v { found = 1 } END { exit !found }' /tmp/shipped.tsv; then
               if [ "${DRY_RUN}" = "true" ]; then
-                echo "[dry-run] would graduate (delete) release go${version}-fips"
+                echo "[dry-run] would remove orphaned release ${rel} (version ${ver} ships nothing)"
               else
-                gh release delete "go${version}-fips" --yes --cleanup-tag
-                echo "Graduated release go${version}-fips (FIPS images are now stable)"
+                gh release delete "$rel" --yes --cleanup-tag
+                echo "Removed orphaned release ${rel}: version ${ver} no longer ships any images"
               fi
             fi
-          done < <(cut -f1 /tmp/shipped.tsv | sort -u)
+          done < <(gh release list --json tagName -q '.[].tagName')
 
           echo "Releases up to date."
