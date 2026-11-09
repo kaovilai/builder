@@ -142,10 +142,14 @@ jobs:
           # jq -s 'add' flattens the paginated response into one array regardless
           # of how gh emits pages, so the selection below always sees all releases.
           # the two newest minors' best releases, newest first — the
-          # selection rules are owned by scripts/go-fips-releases.sh
-          mapfile -t FIPS_ENTRIES < <(scripts/go-fips-releases.sh --top2 | jq -r '
+          # selection rules are owned by scripts/go-fips-releases.sh.
+          # Captured before mapfile: a helper failure inside process
+          # substitution would leave FIPS_ENTRIES empty and silently
+          # skip the week's FIPS updates.
+          fips_top2="$(scripts/go-fips-releases.sh --top2)"
+          mapfile -t FIPS_ENTRIES < <(jq -r '
             to_entries[] | "\(.key) \(.value.pre) \(.value.version)"
-          ')
+          ' <<< "$fips_top2")
 
           for entry in "${FIPS_ENTRIES[@]}"; do
             idx="${entry%% *}"

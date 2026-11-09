@@ -182,10 +182,14 @@ jobs:
             echo "FIPS_SOURCE_TAG=" >> $GITHUB_ENV
           fi
           platform=${{ matrix.platform }}
+          # computed before the echo: a failed helper inside $( ) would
+          # otherwise be masked by echo's success and publish under an
+          # empty prefix
+          prefix="$(scripts/variant-prefix.sh "$UBI" "$FLAVOR")"
           {
             echo "PLATFORM_PAIR=${platform//\//-}"
             echo "VERSION_SAFE=$VERSION_SAFE_INPUT"
-            echo "PREFIX=$(scripts/variant-prefix.sh "$UBI" "$FLAVOR")"
+            echo "PREFIX=$prefix"
           } >> $GITHUB_ENV
 
       - name: add checkout action...
@@ -412,7 +416,8 @@ jobs:
           else
             echo "TAG_KIND=" >> $GITHUB_ENV
           fi
-          echo "PREFIX=$(scripts/variant-prefix.sh "$UBI" "$FLAVOR")" >> $GITHUB_ENV
+          prefix="$(scripts/variant-prefix.sh "$UBI" "$FLAVOR")"
+          echo "PREFIX=$prefix" >> $GITHUB_ENV
 
       - name: download digests...
         uses: actions/download-artifact@v8
