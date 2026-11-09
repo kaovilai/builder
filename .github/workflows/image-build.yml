@@ -46,6 +46,9 @@ jobs:
       FLAVOR: ${{ inputs.flavor }}
       INPUT_VERSION: ${{ inputs.go_version }}
     steps:
+      - name: add checkout action...
+        uses: actions/checkout@v7
+
       - name: Determine versions to build
         id: set-matrix
         env:
@@ -388,6 +391,9 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.determine-versions.outputs.matrix) }}
     steps:
+      - name: add checkout action...
+        uses: actions/checkout@v7
+
       - name: Prepare
         env:
           UBI: ${{ inputs.ubi }}
