@@ -97,17 +97,24 @@ for key, entries in fams.items():
         # active, and the plain one is the stable replacement
         best = None
         for e in entries:
-            is_pre = any(n.endswith("-pre") for n in e["tags"])
             for v in e["versions"]:
                 if v[:2] != minor:
                     continue
-                k = (v, not is_pre)
+                # the kind comes from the matching patch tag, not from
+                # any tag on the digest: a latest*-pre alias can sit on
+                # stable content, and any() would then mark both digests
+                # of a version pre-release, leaving quay order to pick
+                suffix = "v%d.%d.%d" % v
+                plain = next((n for n in e["tags"] if n.endswith(suffix)), None)
+                pre = next((n for n in e["tags"] if n.endswith(suffix + "-pre")), None)
+                tag = plain or pre
+                if tag is None:
+                    continue
+                k = (v, plain is not None)
                 if best is None or k > best[0]:
-                    best = (k, v, e)
+                    best = (k, v, e, tag)
         if best:
-            _, v, e = best
-            suffix = "v%d.%d.%d" % v
-            tag = next(n for n in e["tags"] if n.endswith(suffix) or n.endswith(suffix + "-pre"))
+            _, v, e, tag = best
             version = "%d.%d.%d" % v
             print("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d" % (
                 version, major, flavor, key, e["digest"], tag,
