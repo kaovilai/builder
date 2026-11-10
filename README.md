@@ -26,15 +26,21 @@ The shared, variant-parametrized Dockerfiles in this repository build `quay.io/k
 | `ubi8` | `registry.access.redhat.com/ubi8` | Go toolchain downloaded from go.dev (`Dockerfile`) | `ubi8-latest`, `ubi8-v1.22`, `ubi8-v1.22.3` |
 | `ubi9` | `registry.access.redhat.com/ubi9` | Go toolchain downloaded from go.dev (`Dockerfile`) | `ubi9-latest`, `ubi9-v1.22`, `ubi9-v1.22.3` |
 | `ubi10` | `registry.access.redhat.com/ubi10` | Go toolchain downloaded from go.dev (`Dockerfile`) | `ubi10-latest`, `ubi10-v1.22`, `ubi10-v1.22.3` |
-| `ubi8` FIPS | `registry.access.redhat.com/ubi8` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) (`Dockerfile-fips`) — see [FIPS variants](#fips-variants) | `ubi8-openssl-fips-latest`, `ubi8-openssl-fips-v1.22`, `ubi8-openssl-fips-v1.22.3` |
-| `ubi9` FIPS | `registry.access.redhat.com/ubi9` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) (`Dockerfile-fips`) — see [FIPS variants](#fips-variants) | `ubi9-openssl-fips-latest`, `ubi9-openssl-fips-v1.22`, `ubi9-openssl-fips-v1.22.3` |
-| `ubi10` FIPS | `registry.access.redhat.com/ubi10` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) (`Dockerfile-fips`) — see [FIPS variants](#fips-variants) | `ubi10-openssl-fips-latest`, `ubi10-openssl-fips-v1.22`, `ubi10-openssl-fips-v1.22.3` |
+| `ubi8` FIPS | `registry.access.redhat.com/ubi8` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) (`Dockerfile-fips`) — see [FIPS variants](#fips-variants) | `openssl-fips-latest` (Go ≤1.26, unprefixed), `hostfips-latest` (Go 1.27+), `hostfips-v1.27.3-pre` |
+| `ubi9` FIPS | `registry.access.redhat.com/ubi9` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) (`Dockerfile-fips`) — see [FIPS variants](#fips-variants) | `ubi9-openssl-fips-latest` (Go ≤1.26), `ubi9-hostfips-latest` (Go 1.27+), `ubi9-hostfips-v1.27.3-pre` |
+| `ubi10` FIPS | `registry.access.redhat.com/ubi10` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) (`Dockerfile-fips`) — see [FIPS variants](#fips-variants) | `ubi10-openssl-fips-latest` (Go ≤1.26), `ubi10-hostfips-latest` (Go 1.27+), `ubi10-hostfips-v1.27.3-pre` |
 
 All images are multi-arch (`linux/amd64`, `linux/arm64`, `linux/ppc64le`, `linux/s390x`) and are published to `quay.io/konveyor/builder`. Workflows support manual dispatch (`workflow_dispatch`) with a `go_version` input; a weekly version-aware dispatcher (`scheduled_dispatch.yml`) triggers builds when newer Go versions are released, and builds run on pull requests/pushes that touch the Dockerfiles, `variants.txt`, or the build workflows. The version badges above are generated from the published Quay tags by `readme-badges.yml`, and SBOMs for the published images are submitted to GitHub's dependency graph by `submit-sboms.yml` so Dependabot alerts cover the image contents.
 
 ### FIPS variants
 
 FIPS variants track [golang-fips/go](https://github.com/golang-fips/go) releases per supported Go minor, preferring stable releases and falling back to prereleases when a minor has no stable release yet.
+
+Tag names state the FIPS backend the image actually uses: `openssl-fips`
+for the Go ≤1.26 toolchains (cryptography routed through the OpenSSL FIPS
+module) and `hostfips` for Go 1.27+ (native `crypto/fips140`) — e.g.
+`ubi9-openssl-fips-v1.26.10` and `ubi9-hostfips-v1.27.3-pre`. Each prefix's
+`latest[-pre]` aliases track the newest content of their own generation.
 
 The upstream FIPS approach changed with Go 1.27; the builder builds whatever golang-fips ships per minor:
 
