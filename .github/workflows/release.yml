@@ -154,23 +154,30 @@ jobs:
                 case "$f" in *-fips) has_fips=1 ;; esac
               done <<< "$entries"
               flavor=standard
-              fips_src=""
+              fips_srcs=""
               if [ -n "$has_fips" ]; then
                 flavor=fips
-                # the source tag recorded in the image's label — the
+                # the source tags recorded in the images' labels — the
                 # authoritative answer, immune to a newer upstream
                 # release of the same Go version appearing after the
-                # images were built. Pre-label images fall back to the
-                # current best release of the version.
-                fips_d=$(awk -F'\t' '$2 ~ /-fips$/ {print $3; exit}' <<< "$entries")
-                fips_src=$(scripts/fips-classify.sh --source-tag "$fips_d")
-                if [ -z "$fips_src" ]; then
-                  fips_src=$(jq -r --arg v "$ver" \
-                    '[.[] | select((.tag | split("-")[0] | ltrimstr("go")) == $v)][0].tag // empty' \
-                    /tmp/fips-releases.json)
-                fi
+                # images were built. One DISTINCT tag per release:
+                # drift rebuilds can rebuild one family across a
+                # source change, so families can legitimately differ.
+                # Pre-label images yield no tag, and no inferred tag
+                # is presented as the exact source.
+                while IFS=$'\t' read -r _ f d _ _; do
+                  [ -n "$f" ] || continue
+                  case "$f" in
+                    *-fips)
+                      src=$(scripts/fips-classify.sh --source-tag "$d")
+                      if [ -n "$src" ] && ! grep -qxF "$src" <<< "$fips_srcs"; then
+                        fips_srcs+="${src}"$'\n'
+                      fi
+                      ;;
+                  esac
+                done <<< "$entries"
               fi
-              scripts/release-sources.sh "$flavor" "$ver" "$fips_src"
+              scripts/release-sources.sh "$flavor" "$ver" "$fips_srcs"
               echo
               # RHEL/UBI base CVEs fixed since the previous shipped
               # image of each family (single owner:

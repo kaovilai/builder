@@ -19,16 +19,26 @@ set -euo pipefail
 # failing the run.
 shopt -s inherit_errexit
 
-FLAVOR="${1:?usage: release-sources.sh <standard|fips> <go-version> [fips-source-tag]}"
-VER="${2:?usage: release-sources.sh <standard|fips> <go-version> [fips-source-tag]}"
+FLAVOR="${1:?usage: release-sources.sh <standard|fips> <go-version> [fips-source-tags]}"
+VER="${2:?usage: release-sources.sh <standard|fips> <go-version> [fips-source-tags]}"
 SRC="${3:-}"
 
 minor="${VER%.*}"
 
 echo "### Sources"
 if [ "$FLAVOR" = "fips" ]; then
-  [ -n "$SRC" ] || { echo "ERROR: fips releases need the golang-fips source tag" >&2; exit 1; }
-  echo "- [golang-fips release \`${SRC}\`](https://github.com/golang-fips/go/releases/tag/${SRC}) — the toolchain this release was built from"
+  # one link per DISTINCT recorded source: drift rebuilds can rebuild
+  # one family across a source change, so families of the same release
+  # can legitimately differ. Unlabeled (pre-label) images get an index
+  # link — never an inferred tag presented as the exact source.
+  if [ -n "$SRC" ]; then
+    while read -r t; do
+      [ -n "$t" ] || continue
+      echo "- [golang-fips release \`${t}\`](https://github.com/golang-fips/go/releases/tag/${t}) — the toolchain this release was built from"
+    done <<< "$SRC"
+  else
+    echo "- No recorded source label (the images predate labels) — see the [golang-fips releases for this version](https://github.com/golang-fips/go/releases)"
+  fi
 fi
 echo "- [Go ${minor} release notes](https://go.dev/doc/devel/release#go${minor})"
 echo
