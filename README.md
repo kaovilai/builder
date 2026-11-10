@@ -24,7 +24,7 @@ From time to time Konveyor needs a newer version of Go to build projects than is
 ## Using the images
 
 ```dockerfile
-# pin the patch version for reproducible builds
+# pin an exact Go version
 FROM quay.io/konveyor/builder:ubi9-v1.27.3
 ```
 
@@ -32,8 +32,8 @@ FROM quay.io/konveyor/builder:ubi9-v1.27.3
 podman pull quay.io/konveyor/builder:ubi9-latest
 ```
 
-- **Pinning**: `vX.Y.Z` pins an exact patch (recommended for reproducible builds), `vX.Y` tracks the newest patch of a minor, and `latest` tracks the newest build of the variant. Standard flavors publish only plain tags.
-- **FIPS**: use a FIPS variant below and set [`GODEBUG=fips140=on`](https://github.com/golang-fips/go#godebugfips140) to force FIPS mode regardless of the host (the 1.27+ toolchains default to host-auto). Pre-release-sourced FIPS builds publish only `-pre` tags, so a tag never overstates the release it was built from.
+- **Pinning**: `vX.Y.Z` pins an exact Go version, `vX.Y` tracks the newest patch of a minor, and `latest` tracks the newest build of the variant. Note a pinned version is not a pinned image: existing versions are rebuilt when their UBI base image drifts, moving the tag to the rebuilt content — pin a manifest-list digest (`quay.io/konveyor/builder@sha256:…`) when builds must be bit-for-bit reproducible. Standard flavors publish only plain tags.
+- **FIPS**: use a FIPS variant below. On the 1.27+ `hostfips` toolchains, set [`GODEBUG=fips140=on`](https://github.com/golang-fips/go#godebugfips140) to force FIPS mode regardless of the host (they default to host-auto); the ≤1.26 `openssl-fips` toolchains instead activate FIPS through the OpenSSL FIPS module and ignore that variable. Pre-release-sourced FIPS builds publish only `-pre` tags, so a tag never overstates the release it was built from.
 
 ## Available images
 
@@ -46,7 +46,7 @@ podman pull quay.io/konveyor/builder:ubi9-latest
 | `ubi9` FIPS | `registry.access.redhat.com/ubi9` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) (`Dockerfile-fips`) — see [FIPS variants](#fips-variants) | `ubi9-openssl-fips-latest` (Go ≤1.26), `ubi9-hostfips-latest` (Go 1.27+), `ubi9-hostfips-v1.27.3-pre` |
 | `ubi10` FIPS | `registry.access.redhat.com/ubi10` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) (`Dockerfile-fips`) — see [FIPS variants](#fips-variants) | `ubi10-openssl-fips-latest` (Go ≤1.26), `ubi10-hostfips-latest` (Go 1.27+), `ubi10-hostfips-v1.27.3-pre` |
 
-All images are multi-arch (`linux/amd64`, `linux/arm64`, `linux/ppc64le`, `linux/s390x`) and published to `quay.io/konveyor/builder`. SBOMs for every published image are submitted to GitHub's dependency graph by [`submit-sboms.yml`](.github/workflows/submit-sboms.yml), so Dependabot alerts cover the image contents.
+All images are multi-arch (`linux/amd64`, `linux/arm64`, `linux/ppc64le`, `linux/s390x`) and published to `quay.io/konveyor/builder`. SBOMs for the shipped set — the newest patch of each of the two newest Go minors per variant, the same selection the badges reflect — are submitted to GitHub's dependency graph by [`submit-sboms.yml`](.github/workflows/submit-sboms.yml), so Dependabot alerts cover those images. Older published versions fall outside that scan scope.
 
 Updates are automated: a weekly version-aware dispatcher ([`scheduled_dispatch.yml`](.github/workflows/scheduled_dispatch.yml)) builds newer Go versions as they are released, rebuilds are dispatched automatically when an UBI base image drifts ([`ubi-drift-check.yml`](.github/workflows/ubi-drift-check.yml)), and one-off builds can be dispatched manually (`workflow_dispatch` with a `go_version` input). The version badges above are generated from the published Quay tags by [`readme-badges.yml`](.github/workflows/readme-badges.yml).
 
