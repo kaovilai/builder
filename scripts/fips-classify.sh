@@ -4,6 +4,11 @@
 # Usage: fips-classify.sh <releases-json-file> <version> <tag-last-modified> <manifest-digest>
 # Emits true (pre-release source), false (stable), or unknown (no
 # matching release — callers must refuse to classify).
+# Usage: fips-classify.sh --source-tag <manifest-digest>
+# Emits the exact golang-fips source tag recorded in the image's
+# io.konveyor.builder.go-fips-source label, or nothing when the image
+# predates labels — the authoritative answer to "what was this built
+# from", immune to upstream moving after the build.
 #
 # Rule: builds always use the best release of the version current at
 # build time, so the image is pre-release iff no stable release of
@@ -19,10 +24,16 @@
 set -euo pipefail
 shopt -s inherit_errexit
 
-RELEASES=$1
-VER=$2
-LM=$3
-DIGEST=$4
+source_tag_mode=""
+if [ "${1:-}" = "--source-tag" ]; then
+  source_tag_mode=1
+  DIGEST="${2:?--source-tag needs a manifest digest}"
+else
+  RELEASES=$1
+  VER=$2
+  LM=$3
+  DIGEST=$4
+fi
 
 # the recorded source tag, read back through the quay registry v2 API
 QUAY_TOKEN=$(curl -sfS --retry 3 \
@@ -43,6 +54,11 @@ cfg=$(jq -r '.config.digest' <<< "$list")
 label=$(curl -sfSL --retry 3 -H "Authorization: Bearer ${QUAY_TOKEN}" \
   "https://quay.io/v2/konveyor/builder/blobs/$cfg" \
   | jq -r '.config.Labels["io.konveyor.builder.go-fips-source"] // ""')
+
+if [ -n "$source_tag_mode" ]; then
+  [ -n "$label" ] && echo "$label"
+  exit 0
+fi
 
 if [ -n "$label" ]; then
   jq -rn --arg t "$label" --slurpfile r "$RELEASES" '

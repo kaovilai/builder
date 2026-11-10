@@ -40,6 +40,12 @@ published_tags() {
 # of the selected shipped set (the drift check's publish confirmation
 # looks up tags that may have left the shipped set). Like the default
 # mode, names containing "godev" are excluded.
+# --history: every published patch tag, "version family kind digest
+# tag", with NO selection — the release notes' predecessor lookups need
+# the full published history, not the reduced shipped set (with
+# 1.26.9, 1.26.10, 1.27.2 and 1.27.3 published, the reduced set would
+# compare 1.27.3 against 1.26.10 and wrongly call 1.26.10 a first
+# release). Composable with --from.
 # --latest-by-kind: per family, the newest published patch tag of EACH
 # kind (a "kind" column, "plain"/"pre", replaces "newest" as the last
 # column; at most one row per family per kind, omitted when that kind
@@ -55,6 +61,10 @@ case "${1:-}" in
   --raw)
     published_tags
     exit 0
+    ;;
+  --history)
+    MODE=history
+    shift
     ;;
   --latest-by-kind)
     MODE=latest-by-kind
@@ -76,6 +86,7 @@ python3 - "$TAGS_FILE" "$MODE" <<'PYEOF'
 import re
 import sys
 from collections import defaultdict
+from email.utils import parsedate_to_datetime
 
 by_digest = {}
 last_modified = {}
@@ -103,6 +114,32 @@ for digest, names in by_digest.items():
         if m:
             versions.add((int(m[1]), int(m[2]), int(m[3])))
     fams.setdefault(family(names[0]), []).append({"digest": digest, "tags": names, "versions": versions})
+
+if sys.argv[2] == "history":
+    # one row per family+kind+version, newest last_modified wins: a
+    # migration overlap can leave patch tags of the same version under
+    # BOTH backend prefixes (legacy openssl-fips-named and hostfips-
+    # named), and consumers must not pick between their digests
+    # arbitrarily — the newest push is the currently-published content
+    best = {}
+    for digest, names in by_digest.items():
+        for n in names:
+            m = re.search(r"v(\d+)\.(\d+)\.(\d+)(-pre)?$", n)
+            if not m:
+                continue
+            key = (family(n), "pre" if m[4] else "plain",
+                   (int(m[1]), int(m[2]), int(m[3])))
+            # parsed, not string-compared: quay's RFC-2822 stamps do
+            # not sort chronologically as strings (weekday and month
+            # names lead the string)
+            row = (parsedate_to_datetime(last_modified[n]),
+                   "%s.%s.%s" % (m[1], m[2], m[3]),
+                   family(n), "pre" if m[4] else "plain", digest, n)
+            if key not in best or row[0] > best[key][0]:
+                best[key] = row
+    for row in best.values():
+        print("%s\t%s\t%s\t%s\t%s" % row[1:])
+    sys.exit(0)
 
 if sys.argv[2] == "latest-by-kind":
     # kind filtered before any reduction — see the mode docs above
