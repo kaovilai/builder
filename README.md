@@ -34,7 +34,7 @@ podman pull quay.io/konveyor/builder:ubi9-latest
 ```
 <!-- readme-usage:end -->
 
-- **Pinning**: `vX.Y.Z` pins an exact Go version, `vX.Y` tracks the newest patch of a minor, and `latest` tracks the newest build of the variant. Note a pinned version is not a pinned image: existing versions are rebuilt when their UBI base image drifts, moving the tag to the rebuilt content — pin a manifest-list digest (`quay.io/konveyor/builder@sha256:…`) when builds must be bit-for-bit reproducible. Standard flavors publish only plain tags.
+- **Pinning**: `vX.Y.Z` pins an exact Go version, `vX.Y` tracks the newest patch of a minor as last built (a manually dispatched build of an older patch moves it back), and `latest` tracks the newest build of the variant. Note a pinned version is not a pinned image: existing versions are rebuilt when their UBI base image drifts, moving the tag to the rebuilt content — pin a manifest-list digest (`quay.io/konveyor/builder@sha256:…`) when builds must be bit-for-bit reproducible. Standard flavors publish only plain tags.
 - **FIPS**: use a FIPS variant below. On the 1.27+ `hostfips` toolchains, set [`GODEBUG=fips140=on`](https://github.com/golang-fips/go#godebugfips140) to force FIPS mode regardless of the host (they default to host-auto); the ≤1.26 `openssl-fips` toolchains instead activate FIPS through the OpenSSL FIPS module and ignore that variable — to force FIPS mode on those, set `GOLANG_FIPS=1` (and, on OpenSSL 3, `OPENSSL_FORCE_FIPS_MODE=1` too) ([runtime usage](https://github.com/golang-fips/go/blob/go1.26-fips-release/README.md#forcing-fips-mode-at-runtime)). Pre-release-sourced FIPS builds publish only `-pre` tags, so a tag never overstates the release it was built from.
 
 ## Available images
