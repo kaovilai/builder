@@ -86,6 +86,7 @@ python3 - "$TAGS_FILE" "$MODE" <<'PYEOF'
 import re
 import sys
 from collections import defaultdict
+from email.utils import parsedate_to_datetime
 
 by_digest = {}
 last_modified = {}
@@ -128,7 +129,11 @@ if sys.argv[2] == "history":
                 continue
             key = (family(n), "pre" if m[4] else "plain",
                    (int(m[1]), int(m[2]), int(m[3])))
-            row = (last_modified[n], "%s.%s.%s" % (m[1], m[2], m[3]),
+            # parsed, not string-compared: quay's RFC-2822 stamps do
+            # not sort chronologically as strings (weekday and month
+            # names lead the string)
+            row = (parsedate_to_datetime(last_modified[n]),
+                   "%s.%s.%s" % (m[1], m[2], m[3]),
                    family(n), "pre" if m[4] else "plain", digest, n)
             if key not in best or row[0] > best[key][0]:
                 best[key] = row
