@@ -46,6 +46,11 @@ jobs:
       - name: add checkout action...
         uses: actions/checkout@v7
 
+      - name: configure Trivy...
+        # for scripts/base-cve-diff.sh — the RHEL/UBI CVE diff between
+        # the previous and current images of each release
+        uses: aquasecurity/setup-trivy@v0
+
       - name: Create releases for published versions
         run: |
           set -euo pipefail
@@ -137,6 +142,50 @@ jobs:
               done <<< "$entries"
               echo
               echo "SBOMs for each image and platform (${PLATFORMS// /, }) are attached to this release. Attestations: https://github.com/konveyor/builder/attestations"
+              echo
+              # Upstream sources and the Go CVEs fixed by this version
+              # (single owner: scripts/release-sources.sh). A stable
+              # bucket can carry both standard and stable-sourced fips
+              # families, so the fips source link appears when any
+              # entry is fips.
+              has_fips=""
+              while IFS=$'\t' read -r _ f _ _ _; do
+                [ -n "$f" ] || continue
+                case "$f" in *-fips) has_fips=1 ;; esac
+              done <<< "$entries"
+              flavor=standard
+              fips_src=""
+              if [ -n "$has_fips" ]; then
+                flavor=fips
+                fips_src=$(jq -r --arg v "$ver" \
+                  '[.[] | select((.tag | split("-")[0] | ltrimstr("go")) == $v)][0].tag // empty' \
+                  /tmp/fips-releases.json)
+              fi
+              scripts/release-sources.sh "$flavor" "$ver" "$fips_src"
+              echo
+              # RHEL/UBI base CVEs fixed since the previous shipped
+              # image of each family (single owner:
+              # scripts/base-cve-diff.sh), diffed by digest — tags are
+              # mutable between selection and scan
+              while IFS=$'\t' read -r _ f d t _; do
+                [ -n "$f" ] || continue
+                # shipped.tsv columns: version, family, digest, tag.
+                # The predecessor is the newest row OLDER than this
+                # release's version — the release notes describe what
+                # upgrading fixes, so diffing against a newer image
+                # would be meaningless
+                prev=$(awk -F'\t' -v fam="$f" '$2 == fam {print $1"\t"$3"\t"$4}' /tmp/shipped.tsv \
+                  | sort -V | awk -v ver="$ver" '$1 == ver && p != "" {print p; exit} {p=$0}')
+                if [ -n "$prev" ]; then
+                  prev_d=$(cut -f2 <<< "$prev")
+                  prev_tag=$(cut -f3 <<< "$prev")
+                  scripts/base-cve-diff.sh "quay.io/konveyor/builder@${prev_d}" \
+                    "quay.io/konveyor/builder@${d}" "$prev_tag"
+                else
+                  scripts/base-cve-diff.sh "" "quay.io/konveyor/builder@${d}"
+                fi
+                echo
+              done <<< "$entries"
               if [ "$kind" != "pre" ] && [ -n "$crossref" ]; then
                 echo
                 echo "Pre-release FIPS images for this version are published separately in the [${crossref}](https://github.com/konveyor/builder/releases/tag/${crossref}) release."
