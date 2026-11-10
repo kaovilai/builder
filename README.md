@@ -16,24 +16,39 @@
 <!-- readme-badges:end -->
 
 # Builder
-From time to time we need a newer version of Go to build projects than is available from go-toolset, or other images available on Quay or registry.access.redhat.com.
 
-While there are usually up to date images on docker.io we tend to hit frequent issues with rate limiting when pulling from there to build on Quay.
+Go toolchains on UBI 8/9/10 — standard builds from [go.dev](https://go.dev) and FIPS builds from [golang-fips/go](https://github.com/golang-fips/go) — published as multi-arch images to [`quay.io/konveyor/builder`](https://quay.io/repository/konveyor/builder).
 
-The shared, variant-parametrized Dockerfiles in this repository build `quay.io/konveyor/builder` images with an up to date version of Go, and are published automatically by the GitHub Actions workflows linked above. The variant list lives in [`variants.txt`](variants.txt).
+From time to time Konveyor needs a newer version of Go to build projects than is available from go-toolset or other images on Quay and registry.access.redhat.com; docker.io images are usually current but rate-limit when pulled into Quay builds. The shared, variant-parametrized Dockerfiles in this repository close that gap and are published automatically by the GitHub Actions workflows linked above. The variant list lives in [`variants.txt`](variants.txt).
+
+## Using the images
+
+```dockerfile
+# pin the patch version for reproducible builds
+FROM quay.io/konveyor/builder:ubi9-v1.27.3
+```
+
+```sh
+podman pull quay.io/konveyor/builder:ubi9-latest
+```
+
+- **Pinning**: `vX.Y.Z` pins an exact patch (recommended for reproducible builds), `vX.Y` tracks the newest patch of a minor, and `latest` tracks the newest build of the variant. Standard flavors publish only plain tags.
+- **FIPS**: use a FIPS variant below and set [`GODEBUG=fips140=on`](https://github.com/golang-fips/go#godebugfips140) to force FIPS mode regardless of the host (the 1.27+ toolchains default to host-auto). Pre-release-sourced FIPS builds publish only `-pre` tags, so a tag never overstates the release it was built from.
 
 ## Available images
 
 | Variant | Base | Description | Example tags |
 | --- | --- | --- | --- |
-| `ubi8` | `registry.access.redhat.com/ubi8` | Go toolchain downloaded from go.dev (`Dockerfile`) | `ubi8-latest`, `ubi8-v1.22`, `ubi8-v1.22.3` |
-| `ubi9` | `registry.access.redhat.com/ubi9` | Go toolchain downloaded from go.dev (`Dockerfile`) | `ubi9-latest`, `ubi9-v1.22`, `ubi9-v1.22.3` |
-| `ubi10` | `registry.access.redhat.com/ubi10` | Go toolchain downloaded from go.dev (`Dockerfile`) | `ubi10-latest`, `ubi10-v1.22`, `ubi10-v1.22.3` |
+| `ubi8` | `registry.access.redhat.com/ubi8` | Go toolchain downloaded from go.dev (`Dockerfile`) | `latest`, `v1.27`, `v1.27.3` |
+| `ubi9` | `registry.access.redhat.com/ubi9` | Go toolchain downloaded from go.dev (`Dockerfile`) | `ubi9-latest`, `ubi9-v1.27`, `ubi9-v1.27.3` |
+| `ubi10` | `registry.access.redhat.com/ubi10` | Go toolchain downloaded from go.dev (`Dockerfile`) | `ubi10-latest`, `ubi10-v1.27`, `ubi10-v1.27.3` |
 | `ubi8` FIPS | `registry.access.redhat.com/ubi8` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) (`Dockerfile-fips`) — see [FIPS variants](#fips-variants) | `openssl-fips-latest` (Go ≤1.26, unprefixed), `hostfips-latest` (Go 1.27+), `hostfips-v1.27.3-pre` |
 | `ubi9` FIPS | `registry.access.redhat.com/ubi9` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) (`Dockerfile-fips`) — see [FIPS variants](#fips-variants) | `ubi9-openssl-fips-latest` (Go ≤1.26), `ubi9-hostfips-latest` (Go 1.27+), `ubi9-hostfips-v1.27.3-pre` |
 | `ubi10` FIPS | `registry.access.redhat.com/ubi10` | Go toolchain built from [golang-fips/go](https://github.com/golang-fips/go) (`Dockerfile-fips`) — see [FIPS variants](#fips-variants) | `ubi10-openssl-fips-latest` (Go ≤1.26), `ubi10-hostfips-latest` (Go 1.27+), `ubi10-hostfips-v1.27.3-pre` |
 
-All images are multi-arch (`linux/amd64`, `linux/arm64`, `linux/ppc64le`, `linux/s390x`) and are published to `quay.io/konveyor/builder`. Workflows support manual dispatch (`workflow_dispatch`) with a `go_version` input; a weekly version-aware dispatcher (`scheduled_dispatch.yml`) triggers builds when newer Go versions are released, and builds run on pull requests/pushes that touch the Dockerfiles, `variants.txt`, or the build workflows. The version badges above are generated from the published Quay tags by `readme-badges.yml`, and SBOMs for the published images are submitted to GitHub's dependency graph by `submit-sboms.yml` so Dependabot alerts cover the image contents.
+All images are multi-arch (`linux/amd64`, `linux/arm64`, `linux/ppc64le`, `linux/s390x`) and published to `quay.io/konveyor/builder`. SBOMs for every published image are submitted to GitHub's dependency graph by [`submit-sboms.yml`](.github/workflows/submit-sboms.yml), so Dependabot alerts cover the image contents.
+
+Updates are automated: a weekly version-aware dispatcher ([`scheduled_dispatch.yml`](.github/workflows/scheduled_dispatch.yml)) builds newer Go versions as they are released, rebuilds are dispatched automatically when an UBI base image drifts ([`ubi-drift-check.yml`](.github/workflows/ubi-drift-check.yml)), and one-off builds can be dispatched manually (`workflow_dispatch` with a `go_version` input). The version badges above are generated from the published Quay tags by [`readme-badges.yml`](.github/workflows/readme-badges.yml).
 
 ### FIPS variants
 
@@ -60,11 +75,9 @@ Notable differences for the 1.27+ `hostfips-release` toolchains:
 
 The images keep `GOEXPERIMENT=strictfipsruntime`, which the 1.27+ toolchains still honor ([strict FIPS runtime protection](https://github.com/golang-fips/go#strict-fips-runtime-protection): abort at startup when the host is in FIPS mode but `GODEBUG=fips140` is disabled).
 
-To see the most recent version of Go for EL8:  
-https://vault.centos.org/centos/8-stream/AppStream/Source/SPackages/  
-  
-To see the most recent version of Go for EL9:  
-http://mirror.stream.centos.org/9-stream/AppStream/source/tree/
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) — in particular the one-owner-per-rule table: logic more than one workflow needs lives in exactly one place under `scripts/`, and workflows keep only their orchestration and consumption slice.
 
 ## Code of Conduct
 Refer to Konveyor's Code of Conduct [here](https://github.com/konveyor/community/blob/main/CODE_OF_CONDUCT.md).

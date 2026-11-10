@@ -151,7 +151,13 @@ jobs:
             # latest pre-release actually published — mirroring the
             # source-level go-fips badge pair above; either line is
             # omitted when that kind has no published image
+            prev_major=""
             while read -r major flavor; do
+              # a blank line between UBI groups keeps the badge wall scannable
+              if [ -n "$prev_major" ] && [ "$major" != "$prev_major" ]; then
+                echo ""
+              fi
+              prev_major="$major"
               if [ "$flavor" = "fips" ]; then
                 fips_badge "UBI ${major} FIPS stable" "ubi${major}-fips" plain
                 fips_badge "UBI ${major} FIPS pre-release" "ubi${major}-fips" pre
