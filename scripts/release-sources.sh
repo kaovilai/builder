@@ -77,13 +77,17 @@ cves=$(
   done | sort -u
 )
 if [ -n "$cves" ]; then
-  while IFS=$'\t' read -r id summary cve_ids; do
-    if [ -n "$cve_ids" ]; then
-      echo "- **${cve_ids}** — ${summary} ([${id}](https://osv.dev/vulnerability/${id}))"
-    else
-      echo "- **${id}** — ${summary} ([advisory](https://osv.dev/vulnerability/${id}))"
-    fi
-  done <<< "$cves"
+  # awk with an explicit tab FS, NOT IFS=$'\t' read: whitespace-class
+  # IFS collapses consecutive tabs, and the summary field can be empty
+  # — a collapsed tab would shift the CVE aliases into the summary
+  awk -F'\t' '
+    {
+      if ($3 != "") {
+        print "- **" $3 "** — " $2 " ([" $1 "](https://osv.dev/vulnerability/" $1 "))"
+      } else {
+        print "- **" $1 "** — " $2 " ([advisory](https://osv.dev/vulnerability/" $1 "))"
+      }
+    }' <<< "$cves"
 else
   echo "- None recorded in the [Go vulnerability database](https://osv.dev/list?ecosystem=Go) for this exact version."
 fi
