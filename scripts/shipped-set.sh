@@ -115,14 +115,25 @@ for digest, names in by_digest.items():
     fams.setdefault(family(names[0]), []).append({"digest": digest, "tags": names, "versions": versions})
 
 if sys.argv[2] == "history":
+    # one row per family+kind+version, newest last_modified wins: a
+    # migration overlap can leave patch tags of the same version under
+    # BOTH backend prefixes (legacy openssl-fips-named and hostfips-
+    # named), and consumers must not pick between their digests
+    # arbitrarily — the newest push is the currently-published content
+    best = {}
     for digest, names in by_digest.items():
         for n in names:
             m = re.search(r"v(\d+)\.(\d+)\.(\d+)(-pre)?$", n)
             if not m:
                 continue
-            print("%s.%s.%s\t%s\t%s\t%s\t%s" % (
-                m[1], m[2], m[3], family(n), "pre" if m[4] else "plain",
-                digest, n))
+            key = (family(n), "pre" if m[4] else "plain",
+                   (int(m[1]), int(m[2]), int(m[3])))
+            row = (last_modified[n], "%s.%s.%s" % (m[1], m[2], m[3]),
+                   family(n), "pre" if m[4] else "plain", digest, n)
+            if key not in best or row[0] > best[key][0]:
+                best[key] = row
+    for row in best.values():
+        print("%s\t%s\t%s\t%s\t%s" % row[1:])
     sys.exit(0)
 
 if sys.argv[2] == "latest-by-kind":
