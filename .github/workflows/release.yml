@@ -170,8 +170,17 @@ jobs:
                   case "$f" in
                     *-fips)
                       src=$(scripts/fips-classify.sh --source-tag "$d")
-                      if [ -n "$src" ] && ! grep -qxF "$src" <<< "$fips_srcs"; then
-                        fips_srcs+="${src}"$'\n'
+                      if [ -n "$src" ]; then
+                        if ! grep -qxF "$src" <<< "$fips_srcs"; then
+                          fips_srcs+="${src}"$'\n'
+                        fi
+                      else
+                        # unlabeled image: a "?" line so the notes say
+                        # some sources are unknown instead of silently
+                        # dropping them
+                        if ! grep -qxF "?" <<< "$fips_srcs"; then
+                          fips_srcs+="?"$'\n'
+                        fi
                       fi
                       ;;
                   esac

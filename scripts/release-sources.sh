@@ -29,13 +29,22 @@ echo "### Sources"
 if [ "$FLAVOR" = "fips" ]; then
   # one link per DISTINCT recorded source: drift rebuilds can rebuild
   # one family across a source change, so families of the same release
-  # can legitimately differ. Unlabeled (pre-label) images get an index
-  # link — never an inferred tag presented as the exact source.
+  # can legitimately differ. A "?" line marks an unlabeled (pre-label)
+  # image — never an inferred tag presented as the exact source — and
+  # surfaces a notice even when other entries are labeled.
   if [ -n "$SRC" ]; then
+    unknown=0
     while read -r t; do
       [ -n "$t" ] || continue
+      if [ "$t" = "?" ]; then
+        unknown=1
+        continue
+      fi
       echo "- [golang-fips release \`${t}\`](https://github.com/golang-fips/go/releases/tag/${t}) — the toolchain this release was built from"
     done <<< "$SRC"
+    if [ "$unknown" = 1 ]; then
+      echo "- Some images carry no recorded source label (they predate labels) — see the [golang-fips releases for this version](https://github.com/golang-fips/go/releases)"
+    fi
   else
     echo "- No recorded source label (the images predate labels) — see the [golang-fips releases for this version](https://github.com/golang-fips/go/releases)"
   fi
