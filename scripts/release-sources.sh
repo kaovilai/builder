@@ -23,8 +23,6 @@ FLAVOR="${1:?usage: release-sources.sh <standard|fips> <go-version> [fips-source
 VER="${2:?usage: release-sources.sh <standard|fips> <go-version> [fips-source-tags]}"
 SRC="${3:-}"
 
-minor="${VER%.*}"
-
 echo "### Sources"
 if [ "$FLAVOR" = "fips" ]; then
   # one link per DISTINCT recorded source: drift rebuilds can rebuild
@@ -49,7 +47,8 @@ if [ "$FLAVOR" = "fips" ]; then
     echo "- No recorded source label (the images predate labels) — see the [golang-fips releases for this version](https://github.com/golang-fips/go/releases)"
   fi
 fi
-echo "- [Go ${minor} release notes](https://go.dev/doc/devel/release#go${minor})"
+# the release-history page anchors on FULL versions (go1.27.3), not minors
+echo "- [Go ${VER} release notes](https://go.dev/doc/devel/release#go${VER})"
 echo
 echo "### CVEs fixed in Go ${VER}"
 

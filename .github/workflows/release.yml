@@ -61,6 +61,13 @@ jobs:
           scripts/shipped-set.sh \
             | awk -F'\t' '{print $1"\t"$4"\t"$5"\t"$6"\t"$7}' > /tmp/shipped.tsv
 
+          # the FULL published patch-tag history (no selection): the
+          # release notes' predecessor lookups diff against the
+          # previous published version of each family, which the
+          # reduced shipped set cannot express (it holds only the
+          # newest patch of the two newest minors)
+          scripts/shipped-set.sh --history > /tmp/history.tsv
+
           # golang-fips source releases and the pre-release classification of
           # published FIPS images — both owned by shared scripts (see
           # CONTRIBUTING): go-fips-releases.sh for the release list,
@@ -194,13 +201,27 @@ jobs:
               # mutable between selection and scan
               while IFS=$'\t' read -r _ f d t _; do
                 [ -n "$f" ] || continue
-                # shipped.tsv columns: version, family, digest, tag.
-                # The predecessor is the newest row OLDER than this
-                # release's version — the release notes describe what
-                # upgrading fixes, so diffing against a newer image
-                # would be meaningless
-                prev=$(awk -F'\t' -v fam="$f" '$2 == fam {print $1"\t"$3"\t"$4}' /tmp/shipped.tsv \
+                # history.tsv columns: version, family, kind, digest,
+                # tag. The predecessor is the newest published version
+                # of the same family AND kind older than this release
+                # — the notes describe what upgrading fixes, so
+                # diffing against a newer image would be meaningless,
+                # and a consumer of a -pre image came from the
+                # previous -pre build
+                kind=plain
+                case "$t" in *-pre) kind=pre ;; esac
+                prev=$(awk -F'\t' -v fam="$f" -v k="$kind" \
+                  '$2 == fam && $3 == k {print $1"\t"$4"\t"$5}' /tmp/history.tsv \
                   | sort -V | awk -v ver="$ver" '$1 == ver && p != "" {print p; exit} {p=$0}')
+                if [ -z "$prev" ]; then
+                  # the first -pre of a family has no -pre predecessor:
+                  # fall back to the previous stable of the family, so
+                  # the notes still describe what moving from stable
+                  # to this pre-release fixes
+                  prev=$(awk -F'\t' -v fam="$f" \
+                    '$2 == fam {print $1"\t"$4"\t"$5}' /tmp/history.tsv \
+                    | sort -V | awk -v ver="$ver" '$1 == ver && p != "" {print p; exit} {p=$0}')
+                fi
                 if [ -n "$prev" ]; then
                   prev_d=$(cut -f2 <<< "$prev")
                   prev_tag=$(cut -f3 <<< "$prev")
