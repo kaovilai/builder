@@ -157,9 +157,18 @@ jobs:
               fips_src=""
               if [ -n "$has_fips" ]; then
                 flavor=fips
-                fips_src=$(jq -r --arg v "$ver" \
-                  '[.[] | select((.tag | split("-")[0] | ltrimstr("go")) == $v)][0].tag // empty' \
-                  /tmp/fips-releases.json)
+                # the source tag recorded in the image's label — the
+                # authoritative answer, immune to a newer upstream
+                # release of the same Go version appearing after the
+                # images were built. Pre-label images fall back to the
+                # current best release of the version.
+                fips_d=$(awk -F'\t' '$2 ~ /-fips$/ {print $3; exit}' <<< "$entries")
+                fips_src=$(scripts/fips-classify.sh --source-tag "$fips_d")
+                if [ -z "$fips_src" ]; then
+                  fips_src=$(jq -r --arg v "$ver" \
+                    '[.[] | select((.tag | split("-")[0] | ltrimstr("go")) == $v)][0].tag // empty' \
+                    /tmp/fips-releases.json)
+                fi
               fi
               scripts/release-sources.sh "$flavor" "$ver" "$fips_src"
               echo

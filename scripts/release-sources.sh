@@ -40,10 +40,13 @@ echo "### CVEs fixed in Go ${VER}"
 cves=$(
   page=""
   while :; do
+    # page_token belongs in the JSON body (OSV's pagination contract),
+    # not the URL — a URL token is ignored and the first page repeats
+    body=$(jq -cn --arg pt "$page" \
+      '{"package":{"name":"stdlib","ecosystem":"Go"}} + (if $pt == "" then {} else {page_token: $pt} end)')
     resp=$(curl -sfS --retry 3 --retry-delay 5 --max-time 30 \
       -H 'Content-Type: application/json' \
-      -d '{"package":{"name":"stdlib","ecosystem":"Go"}}' \
-      "https://api.osv.dev/v1/query?page_token=${page}")
+      -d "$body" "https://api.osv.dev/v1/query")
     jq -r --arg v "$VER" '
       .vulns[]?
       | select(.affected[]? | select(.package.name == "stdlib")
