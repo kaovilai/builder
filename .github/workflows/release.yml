@@ -49,7 +49,7 @@ jobs:
       - name: configure Trivy...
         # for scripts/base-cve-diff.sh — the RHEL/UBI CVE diff between
         # the previous and current images of each release
-        uses: aquasecurity/setup-trivy@v0
+        uses: aquasecurity/setup-trivy@v0.3.1
 
       - name: Create releases for published versions
         run: |
