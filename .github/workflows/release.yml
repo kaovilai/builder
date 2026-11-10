@@ -208,11 +208,17 @@ jobs:
                 # diffing against a newer image would be meaningless,
                 # and a consumer of a -pre image came from the
                 # previous -pre build
-                kind=plain
-                case "$t" in *-pre) kind=pre ;; esac
-                prev=$(awk -F'\t' -v fam="$f" -v k="$kind" \
+                # tag_kind (NOT `kind` — that is publish_release's $5
+                # parameter, which drives gh release edit --prerelease)
+                tag_kind=plain
+                case "$t" in *-pre) tag_kind=pre ;; esac
+                # one row per version: the oldest version can carry
+                # plain and pre rows, and a duplicate would read as the
+                # current version's own predecessor
+                prev=$(awk -F'\t' -v fam="$f" -v k="$tag_kind" \
                   '$2 == fam && $3 == k {print $1"\t"$4"\t"$5}' /tmp/history.tsv \
-                  | sort -V | awk -v ver="$ver" '$1 == ver && p != "" {print p; exit} {p=$0}')
+                  | sort -V | awk -F'\t' '!seen[$1]++' \
+                  | awk -v ver="$ver" '$1 == ver && p != "" {print p; exit} {p=$0}')
                 if [ -z "$prev" ]; then
                   # the first -pre of a family has no -pre predecessor:
                   # fall back to the previous stable of the family, so
@@ -220,7 +226,8 @@ jobs:
                   # to this pre-release fixes
                   prev=$(awk -F'\t' -v fam="$f" \
                     '$2 == fam {print $1"\t"$4"\t"$5}' /tmp/history.tsv \
-                    | sort -V | awk -v ver="$ver" '$1 == ver && p != "" {print p; exit} {p=$0}')
+                    | sort -V | awk -F'\t' '!seen[$1]++' \
+                    | awk -v ver="$ver" '$1 == ver && p != "" {print p; exit} {p=$0}')
                 fi
                 if [ -n "$prev" ]; then
                   prev_d=$(cut -f2 <<< "$prev")
