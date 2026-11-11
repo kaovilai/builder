@@ -100,7 +100,7 @@ jobs:
               for platform in $PLATFORMS; do
                 out="${f}-${platform//\//-}-${d#sha256:}.spdx.json"
                 [ -n "$3" ] && grep -qx "$out" "$3" && continue
-                docker run --rm -v "${2}:/out" docker.io/anchore/syft:1.33.0 \
+                docker run --rm -v "${2}:/out" docker.io/anchore/syft:v1.33.0 \
                   scan "$image" --platform "$platform" -o spdx-json --file "/out/${out}" >/dev/null
               done
             done <<< "$1"
