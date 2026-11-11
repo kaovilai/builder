@@ -8,9 +8,14 @@ on:
   pull_request:
     paths:
       - '.github/workflows/**'
+      # the actionlint image pin and its lookup feed this job
+      - 'docker-compose.yml'
+      - 'scripts/tool-pins.sh'
   push:
     paths:
       - '.github/workflows/**'
+      - 'docker-compose.yml'
+      - 'scripts/tool-pins.sh'
 
 permissions:
   contents: read
