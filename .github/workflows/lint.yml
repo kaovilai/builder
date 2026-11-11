@@ -27,5 +27,7 @@ jobs:
         # pipelines in the variant enumerations, and
         # unquoted $(ls /tmp/digests) word-splitting when passing digest lists.
         run: |
-          docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color \
+          # image pin owned by docker-compose.yml, bumped by Dependabot
+          # (single owner of the lookup: scripts/tool-pins.sh)
+          docker run --rm -v "$PWD:/repo" -w /repo "$(scripts/tool-pins.sh actionlint)" -color \
             -ignore 'shellcheck reported issue in this script: SC(2010|2012|2046|2086)'

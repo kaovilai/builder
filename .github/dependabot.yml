@@ -1,5 +1,26 @@
 version: 2
 updates:
+  # Keep the CI tool image pins current (syft, actionlint — declared
+  # in docker-compose.yml, the single source of truth the workflows
+  # read through scripts/tool-pins.sh). Dependabot's docker and
+  # github-actions ecosystems cannot see `docker run` references in
+  # workflow run blocks, so compose is the trackable pin location.
+  # The UBI base images are deliberately NOT here: their FROM lines
+  # are parameterized (latest) and owned by ubi-drift-check.yml.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      version-updates:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
   # Keep the pinned GitHub Actions current (checkout, docker/*, attest,
   # sbom-action, upload/download-artifact). Updates are grouped per update
   # type (applies-to accepts only version-updates or security-updates, and
