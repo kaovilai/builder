@@ -14,9 +14,29 @@ set -euo pipefail
 # Bash clears errexit inside command substitutions unless this is set.
 shopt -s inherit_errexit
 
-SERVICE="${1:?usage: tool-pins.sh <service>}"
 COMPOSE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/docker-compose.yml"
 [ -r "$COMPOSE" ] || { echo "ERROR: $COMPOSE not found" >&2; exit 1; }
+
+# --all: every declared service name, one per line — for the lint
+# job's pin-resolution check
+if [ "${1:-}" = "--all" ]; then
+  python3 - "$COMPOSE" <<'INNER'
+import re, sys
+
+section = False
+for line in open(sys.argv[1]):
+    if line.rstrip() == "services:":
+        section = True
+        continue
+    if section:
+        m = re.match(r"^  ([A-Za-z0-9_-]+):", line)
+        if m:
+            print(m.group(1))
+INNER
+  exit 0
+fi
+
+SERVICE="${1:?usage: tool-pins.sh <service>|--all}"
 
 image=$(python3 - "$COMPOSE" "$SERVICE" <<'PY'
 import re, sys

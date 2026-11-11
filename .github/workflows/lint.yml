@@ -27,6 +27,19 @@ jobs:
       - name: add checkout action...
         uses: actions/checkout@v7
 
+      - name: validate tool image pins...
+        # a pin that does not resolve is exactly the syft 1.33.0
+        # release-run failure class; catch it here, at PR time, where
+        # the release dry-run cannot (it skips SBOM scanning)
+        run: |
+          set -euo pipefail
+          while read -r service; do
+            [ -n "$service" ] || continue
+            image="$(scripts/tool-pins.sh "$service")"
+            docker pull -q "$image" >/dev/null
+            echo "pin ok: ${service} -> ${image}"
+          done < <(scripts/tool-pins.sh --all)
+
       - name: run actionlint...
         # The ignored shellcheck codes are deliberate repo patterns: ls | sort
         # pipelines in the variant enumerations, and
