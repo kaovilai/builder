@@ -15,7 +15,7 @@
 [![go-fips pre-release](https://img.shields.io/badge/go--fips_pre--release-Go_1.27.3-orange)](https://github.com/golang-fips/go/releases)
 [![UBI 8 FIPS stable](https://img.shields.io/badge/UBI_8_FIPS_stable-Go_1.26.10-blueviolet)](https://quay.io/repository/konveyor/builder?tab=tags)
 [![UBI 8 FIPS pre-release](https://img.shields.io/badge/UBI_8_FIPS_pre--release-Go_1.27.3-orange)](https://quay.io/repository/konveyor/builder?tab=tags)
-[![UBI 8](https://img.shields.io/badge/UBI_8-Go_1.27.3-blue)](https://quay.io/repository/konveyor/builder?tab=tags)
+[![UBI 8](https://img.shields.io/badge/UBI_8-Go_1.27.4-blue)](https://quay.io/repository/konveyor/builder?tab=tags)
 
 [![UBI 9 FIPS stable](https://img.shields.io/badge/UBI_9_FIPS_stable-Go_1.26.10-blueviolet)](https://quay.io/repository/konveyor/builder?tab=tags)
 [![UBI 9 FIPS pre-release](https://img.shields.io/badge/UBI_9_FIPS_pre--release-Go_1.27.3-orange)](https://quay.io/repository/konveyor/builder?tab=tags)
