@@ -61,11 +61,14 @@ godev_hist="$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all' \
 history_tsv="$("$(dirname "$0")/shipped-set.sh" --history)"
 plain_hist="$(awk -F'\t' '$2 !~ /-fips$/ && $3 == "plain" {print $1}' <<< "$history_tsv" \
   | sort -uV | tail -n "$((TRAIL + 1))")"
-# FIPS plain-tag candidates as version, digest, last_modified (one row
-# per version; families push together) plus the -pre tag versions. Whether
-# a plain tag is really stable is decided by fips-classify.sh below.
-fips_candidates="$(awk -F'\t' '$2 ~ /-fips$/ && $3 == "plain" && !seen[$1]++ {print $1"\t"$4"\t"$6}' <<< "$history_tsv" \
-  | sort -V | tail -n "$((TRAIL + 1))")"
+# Every FIPS plain-tag row as version, digest, last_modified — no
+# dedupe or window before classification: pruning first could drop a
+# published stable image because four newer pre-release/unknown
+# versions exhausted the cutoff, and picking one family's row per
+# version could prefer a pre-release-sourced sibling over a stable one.
+# Whether a row is really stable is decided by fips-classify.sh below;
+# identical digests are classified once.
+fips_candidates="$(awk -F'\t' '$2 ~ /-fips$/ && $3 == "plain" {print $1"\t"$4"\t"$6}' <<< "$history_tsv")"
 fips_tag_pre="$(awk -F'\t' '$2 ~ /-fips$/ && $3 == "pre" {print $1}' <<< "$history_tsv" \
   | sort -uV | tail -n 1)"
 
@@ -105,25 +108,32 @@ def ver_key(v):
 
 # FIPS plain tags are only "stable" when their golang-fips source
 # classifies stable — the classifier owns the rule (image label first,
-# push-time fallback for pre-label images); an unknown source is
-# excluded from the stable lane rather than mislabeled.
-fips_stable, fips_pre_versions = [], []
+# push-time fallback for pre-label images). Aggregate per version
+# across its family rows: any stable-sourced row makes the version
+# stable; a version with only pre-release sources joins the
+# pre-release selection; unknown sources are excluded from both rather
+# than mislabeled. The window is applied AFTER classification.
+ver_cls = {}
+digest_cls = {}
 for line in os.environ["FIPS_CANDIDATES"].splitlines():
     if not line.strip():
         continue
     ver, digest, ts = line.split("\t")
-    cls = subprocess.run(
-        [os.environ["CLASSIFIER"], releases, ver, ts, digest],
-        capture_output=True, text=True)
-    if cls.returncode != 0:
-        sys.exit(f"ERROR: fips-classify failed for {ver}: {cls.stderr.strip()}")
-    cls = cls.stdout.strip()
-    if cls == "false":
-        fips_stable.append(ver)
-    elif cls == "true":
-        fips_pre_versions.append(ver)
-    elif cls != "unknown":
+    if digest not in digest_cls:
+        cls = subprocess.run(
+            [os.environ["CLASSIFIER"], releases, ver, ts, digest],
+            capture_output=True, text=True)
+        if cls.returncode != 0:
+            sys.exit(f"ERROR: fips-classify failed for {ver}: {cls.stderr.strip()}")
+        digest_cls[digest] = cls.stdout.strip()
+    cls = digest_cls[digest]
+    if cls not in ("true", "false", "unknown"):
         sys.exit(f"ERROR: unexpected FIPS classification {cls!r} for {ver}")
+    ver_cls.setdefault(ver, set()).add(cls)
+
+fips_stable = [v for v, cls in ver_cls.items() if "false" in cls]
+fips_pre_versions = [v for v, cls in ver_cls.items()
+                     if "false" not in cls and "true" in cls]
 if tag_pre:
     fips_pre_versions.append(tag_pre)
 fips_pre = max(sorted(set(fips_pre_versions)), key=ver_key) if fips_pre_versions else ""
@@ -136,7 +146,9 @@ if summary_only:
     print(json.dumps({**heads, "fips_pre": fips_pre}, separators=(",", ":")))
     sys.exit(0)
 
-fips = fips_stable
+# window the classified-stable versions only now, so the axis covers
+# exactly the cars that are drawn
+fips = sorted(set(fips_stable), key=ver_key)[-(trail_n + 1):]
 
 # Categorical palette (fixed slot order: the three tracks in their
 # listed order), validated for CVD separation and contrast on both
@@ -200,7 +212,11 @@ css = """
   @keyframes spin { to { transform: rotate(360deg); } }
   .bob  { animation: bob 1.1s ease-in-out infinite alternate; }
   @keyframes bob { to { transform: translateY(1.5px); } }
-  .puff { animation: puff 2.4s ease-out infinite; }
+  .puff { animation: puff 2.4s ease-out infinite;
+          /* scale about the circle's own center; without this the
+             default (0,0) origin drags the puff toward the top-left of
+             the canvas instead of rising above the chimney */
+          transform-box: fill-box; transform-origin: center; }
   @keyframes puff {
     0%   { opacity: 0;   transform: translate(0,0) scale(.4); }
     25%  { opacity: .45; }
