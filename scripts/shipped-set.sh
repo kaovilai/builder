@@ -13,7 +13,7 @@
 # 0 otherwise. godev tags are excluded.
 #
 # Consumers: release.yml, smoke-test.yml, submit-sboms.yml,
-# ubi-drift-check.yml, readme-badges.yml — keep this script the single
+# ubi-drift-check.yml, readme-tracks.yml — keep this script the single
 # owner of the selection rules.
 
 set -euo pipefail
@@ -41,10 +41,11 @@ published_tags() {
 # looks up tags that may have left the shipped set). Like the default
 # mode, names containing "godev" are excluded.
 # --history: every published patch tag, "version family kind digest
-# tag", with NO selection — the release notes' predecessor lookups need
-# the full published history, not the reduced shipped set (with
-# 1.26.9, 1.26.10, 1.27.2 and 1.27.3 published, the reduced set would
-# compare 1.27.3 against 1.26.10 and wrongly call 1.26.10 a first
+# tag last_modified" (the tag's last_modified feeds pre-release
+# classification), with NO selection — the release notes' predecessor
+# lookups need the full published history, not the reduced shipped set
+# (with 1.26.9, 1.26.10, 1.27.2 and 1.27.3 published, the reduced set
+# would compare 1.27.3 against 1.26.10 and wrongly call 1.26.10 a first
 # release). Composable with --from.
 # --latest-by-kind: per family, the newest published patch tag of EACH
 # kind (a "kind" column, "plain"/"pre", replaces "newest" as the last
@@ -134,11 +135,12 @@ if sys.argv[2] == "history":
             # names lead the string)
             row = (parsedate_to_datetime(last_modified[n]),
                    "%s.%s.%s" % (m[1], m[2], m[3]),
-                   family(n), "pre" if m[4] else "plain", digest, n)
+                   family(n), "pre" if m[4] else "plain", digest, n,
+                   last_modified[n])
             if key not in best or row[0] > best[key][0]:
                 best[key] = row
     for row in best.values():
-        print("%s\t%s\t%s\t%s\t%s" % row[1:])
+        print("%s\t%s\t%s\t%s\t%s\t%s" % row[1:])
     sys.exit(0)
 
 if sys.argv[2] == "latest-by-kind":

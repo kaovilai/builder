@@ -13,7 +13,7 @@
 # the openssl-fips backend.
 #
 # Consumers: image-build.yml, scheduled_dispatch.yml, release.yml,
-# readme-badges.yml — keep this script the single owner of the rules.
+# readme-tracks.yml — keep this script the single owner of the rules.
 
 set -euo pipefail
 # Bash clears errexit inside command substitutions unless this is set;
@@ -24,6 +24,11 @@ shopt -s inherit_errexit
 # the lookup owns its retries (CONTRIBUTING): a transient gh failure
 # discards any partial result and retries the complete pagination
 FIPS_RELEASES=""
+# If a caller exported FIPS_RELEASES (a plain env name no script can
+# rely on being free), bash keeps the export flag on reassignment and
+# the multi-megabyte JSON would ride the environment into every child —
+# jq then dies with E2BIG. This script is the only owner of the value.
+declare +x FIPS_RELEASES
 for attempt in 1 2 3; do
   if FIPS_RELEASES=$(gh api repos/golang-fips/go/releases --paginate | jq -s 'add'); then
     break

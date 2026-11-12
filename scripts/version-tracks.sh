@@ -4,21 +4,29 @@
 #
 # Three tracks, one shared Go-version axis:
 #   go.dev      — upstream stable releases (go.dev/dl)
-#   ubi go-fips — the FIPS images published to quay (stable tags)
+#   ubi go-fips — the FIPS images published to quay, restricted to
+#                 builds whose golang-fips source classifies stable
+#                 (fips-classify.sh: label-first, push-time fallback)
 #   ubi         — the standard images published to quay
 # Each track's engine sits at its latest stable version; older releases
 # trail behind as fading cars at their own axis positions, so the gap
 # between the go.dev train and a quay train is the shipping lag, at a
-# glance. A dashed ghost car ahead of the FIPS engine marks its latest
-# published pre-release.
+# glance. A dashed ghost car ahead of the FIPS engine marks the latest
+# published pre-release-sourced build — a plain-tag image built from a
+# pre-release go-fips source counts here, never as "stable".
 #
 # Each lane's engine is the newest stable version published across that
 # lane's variant families (ubi8/9/10 normally advance in lockstep); a
 # family that lags is not depicted separately — the README's available-
 # images table and the quay tags page carry the per-family detail.
 #
-# Usage: version-tracks.sh [--dark]   → SVG on stdout
-# Owners of the inputs: go.dev/dl JSON, shipped-set.sh --history (quay).
+# Usage: version-tracks.sh [--dark]    → SVG on stdout
+#        version-tracks.sh --summary   → one JSON line of lane heads
+#                                        ({"godev":…,"ubi":…,"fips":…,
+#                                        "fips_pre":…}) for the README's
+#                                        generated text summary
+# Owners of the inputs: go.dev/dl JSON, shipped-set.sh --history (quay),
+# go-fips-releases.sh + fips-classify.sh (FIPS source classification).
 # Refreshed by .github/workflows/readme-tracks.yml, which commits the
 # rendered docs/version-tracks{,-dark}.svg.
 
@@ -27,8 +35,13 @@ set -euo pipefail
 shopt -s inherit_errexit
 
 MODE=light
-[ "${1:-}" = "--dark" ] && MODE=dark
-[ $# -le 1 ] || { echo "usage: $0 [--dark]" >&2; exit 1; }
+SUMMARY=""
+case "${1:-}" in
+  --dark)    MODE=dark ;;
+  --summary) SUMMARY=1 ;;
+  "")        ;;
+  *)         echo "usage: $0 [--dark|--summary]" >&2; exit 1 ;;
+esac
 
 # Engine + this many trailing cars per track (older cars beyond this are
 # dropped so the axis stays readable).
@@ -41,29 +54,89 @@ godev_hist="$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all' \
            | sort_by(split(".") | map(tonumber)) | reverse
            | .[0:'"$((TRAIL + 1))"'] | .[]')"
 
-# Published quay history (version, family, kind, digest, tag), newest
-# last: the shared selector's --history mode is the single owner of the
-# published-tag view (see CONTRIBUTING). FIPS families end in -fips.
+# Published quay history (version, family, kind, digest, tag,
+# last_modified): the shared selector's --history mode is the single
+# owner of the published-tag view (see CONTRIBUTING). FIPS families end
+# in -fips.
 history_tsv="$("$(dirname "$0")/shipped-set.sh" --history)"
 plain_hist="$(awk -F'\t' '$2 !~ /-fips$/ && $3 == "plain" {print $1}' <<< "$history_tsv" \
   | sort -uV | tail -n "$((TRAIL + 1))")"
-fips_hist="$(awk -F'\t' '$2 ~ /-fips$/ && $3 == "plain" {print $1}' <<< "$history_tsv" \
-  | sort -uV | tail -n "$((TRAIL + 1))")"
-fips_pre="$(awk -F'\t' '$2 ~ /-fips$/ && $3 == "pre" {print $1}' <<< "$history_tsv" \
+# FIPS plain-tag candidates as version, digest, last_modified (one row
+# per version; families push together) plus the -pre tag versions. Whether
+# a plain tag is really stable is decided by fips-classify.sh below.
+fips_candidates="$(awk -F'\t' '$2 ~ /-fips$/ && $3 == "plain" && !seen[$1]++ {print $1"\t"$4"\t"$6}' <<< "$history_tsv" \
+  | sort -V | tail -n "$((TRAIL + 1))")"
+fips_tag_pre="$(awk -F'\t' '$2 ~ /-fips$/ && $3 == "pre" {print $1}' <<< "$history_tsv" \
   | sort -uV | tail -n 1)"
 
-MODE="$MODE" TRAIL="$TRAIL" GODEV="$godev_hist" PLAIN="$plain_hist" FIPS="$fips_hist" \
-FIPS_PRE="$fips_pre" python3 <<'PY'
+fips_releases_file="$(mktemp /tmp/version-tracks-fips.XXXXXX)"
+trap 'rm -f "$fips_releases_file"' EXIT
+
+MODE="$MODE" SUMMARY="$SUMMARY" TRAIL="$TRAIL" GODEV="$godev_hist" \
+PLAIN="$plain_hist" FIPS_CANDIDATES="$fips_candidates" FIPS_TAG_PRE="$fips_tag_pre" \
+CLASSIFIER="$(dirname "$0")/fips-classify.sh" FIPS_JSON="$fips_releases_file" \
+FIPS_RELEASES_SRC="$(dirname "$0")/go-fips-releases.sh" \
+python3 <<'PY'
+import json
 import math
 import os
+import subprocess
 import sys
 
 mode = os.environ["MODE"]
+summary_only = os.environ["SUMMARY"] == "1"
 trail_n = int(os.environ["TRAIL"])
 godev = os.environ["GODEV"].split()
 plain = os.environ["PLAIN"].split()
-fips = os.environ["FIPS"].split()
-fips_pre = os.environ["FIPS_PRE"].strip()
+tag_pre = os.environ["FIPS_TAG_PRE"].strip()
+
+# golang-fips release list, materialized once for the classifier (it
+# takes a file, not the generator's stdout)
+releases = os.environ["FIPS_JSON"]
+gen = subprocess.run([os.environ["FIPS_RELEASES_SRC"]],
+                     capture_output=True, text=True)
+if gen.returncode != 0:
+    sys.exit(f"ERROR: golang-fips release list failed: {gen.stderr.strip()}")
+with open(releases, "w") as f:
+    f.write(gen.stdout)
+
+def ver_key(v):
+    return [int(p) for p in v.split(".")]
+
+# FIPS plain tags are only "stable" when their golang-fips source
+# classifies stable — the classifier owns the rule (image label first,
+# push-time fallback for pre-label images); an unknown source is
+# excluded from the stable lane rather than mislabeled.
+fips_stable, fips_pre_versions = [], []
+for line in os.environ["FIPS_CANDIDATES"].splitlines():
+    if not line.strip():
+        continue
+    ver, digest, ts = line.split("\t")
+    cls = subprocess.run(
+        [os.environ["CLASSIFIER"], releases, ver, ts, digest],
+        capture_output=True, text=True)
+    if cls.returncode != 0:
+        sys.exit(f"ERROR: fips-classify failed for {ver}: {cls.stderr.strip()}")
+    cls = cls.stdout.strip()
+    if cls == "false":
+        fips_stable.append(ver)
+    elif cls == "true":
+        fips_pre_versions.append(ver)
+    elif cls != "unknown":
+        sys.exit(f"ERROR: unexpected FIPS classification {cls!r} for {ver}")
+if tag_pre:
+    fips_pre_versions.append(tag_pre)
+fips_pre = max(sorted(set(fips_pre_versions)), key=ver_key) if fips_pre_versions else ""
+
+def head_of(vs):
+    return max(sorted(set(vs)), key=ver_key) if vs else ""
+
+heads = {"godev": head_of(godev), "ubi": head_of(plain), "fips": head_of(fips_stable)}
+if summary_only:
+    print(json.dumps({**heads, "fips_pre": fips_pre}, separators=(",", ":")))
+    sys.exit(0)
+
+fips = fips_stable
 
 # Categorical palette (fixed slot order: the three tracks in their
 # listed order), validated for CVD separation and contrast on both
@@ -83,45 +156,42 @@ tracks = [
     ("go.dev", C["blue"], godev, None,
      "upstream stable releases"),
     ("ubi go-fips", C["orange"], fips, fips_pre,
-     "FIPS images on quay (stable)"),
+     "FIPS images on quay"),
     ("ubi", C["aqua"], plain, None,
      "standard images on quay"),
 ]
 
 # Shared axis: the union of every version any track shows, oldest first.
 axis = sorted({v for _, _, vs, _, _ in tracks for v in vs} | {fips_pre} - {""},
-              key=lambda s: [int(p) for p in s.split(".")])
+              key=ver_key)
 if not axis:
     sys.exit("ERROR: no versions gathered for any track")
 
-W, H = 980, 440
-LEFT, RIGHT, TOP = 150, 110, 88          # right margin leaves nose room
-plot_w = W - LEFT - RIGHT
+# Fixed spacing, not a stretched plot: adjacent positions stay far
+# enough apart for car + engine geometry at any axis length (an
+# engine's nose reaches 50 units, a car 22).
+SPACING = 110
+LEFT, RIGHT, TOP = 210, 90, 88
+H = 440
+W = LEFT + RIGHT + SPACING * max(len(axis) - 1, 1)
 row_y = [160, 262, 364]                  # rail-top y per track
 AXIS_Y = H - 30
 
 def x_of(ver):
-    # a single-position axis (everything in lockstep and no history yet)
-    # still needs a drawable center instead of a divide-by-zero
-    if len(axis) == 1:
-        return LEFT + plot_w / 2
-    return LEFT + axis.index(ver) * plot_w / (len(axis) - 1)
-
-def ver_key(v):
-    return [int(p) for p in v.split(".")]
+    return LEFT + axis.index(ver) * SPACING
 
 svg = []
 svg.append('<?xml version="1.0" encoding="UTF-8"?>')
 svg.append('<!-- generated by scripts/version-tracks.sh via '
-           '.github/workflows/readme-badges.yml; do not edit -->')
+           '.github/workflows/readme-tracks.yml; do not edit -->')
 svg.append(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" '
            'role="img" aria-labelledby="tt td" font-family="-apple-system,'
            " 'Segoe UI', Helvetica, Arial, sans-serif\">")
-svg.append(f'<title id="tt">Go version tracks</title>')
-svg.append(f'<desc id="td">Latest stable Go version per source — go.dev '
-           f'upstream, the UBI go-fips images, and the standard UBI images — '
-           f'as trains on three tracks over a shared version axis; older '
-           f'releases trail behind each engine.</desc>')
+svg.append('<title id="tt">Go version tracks</title>')
+svg.append('<desc id="td">Latest stable Go version per source — go.dev '
+           'upstream, the UBI go-fips images, and the standard UBI images — '
+           'as trains on three tracks over a shared version axis; older '
+           'releases trail behind each engine.</desc>')
 
 css = """
 <style>
@@ -210,8 +280,9 @@ def engine(ex, rail, color, ver):
                  f'r="4" fill="{C["ink2"]}" style="animation-delay:'
                  f'{delay}s"/>')
     # headlight
-    s.append(f'<circle cx="{ex + 41}" cy="{rail - 30}" r="3.5" '
-             f'fill="{C["lamp"]}"/>')
+    svg_lamp = (f'<circle cx="{ex + 41}" cy="{rail - 30}" r="3.5" '
+                f'fill="{C["lamp"]}"/>')
+    s.append(svg_lamp)
     # wheels
     for cx in (ex - 28, ex - 6, ex + 20):
         s.append(wheel(cx, rail - 7, 7, color))
@@ -224,16 +295,17 @@ def engine(ex, rail, color, ver):
 for (name, color, versions, ghost_ver, note), rail in zip(tracks, row_y):
     # oldest → newest regardless of the input order each source uses
     versions = sorted(set(versions), key=ver_key)[-(trail_n + 1):]
-    # track label, left margin
+    # track label, left margin — the note column is wide enough that the
+    # leftmost car never paints over it
     svg.append(f'<text x="20" y="{rail - 40}" font-size="14" '
                f'font-weight="600" fill="{C["ink"]}">{name}</text>')
     svg.append(f'<text x="20" y="{rail - 24}" font-size="10.5" '
                f'fill="{C["ink2"]}">{note}</text>')
     # rails: a running line with dashed ties beneath it
-    svg.append(f'<line x1="{LEFT - 60}" y1="{rail}" x2="{W - 20}" '
+    svg.append(f'<line x1="{LEFT - 110}" y1="{rail}" x2="{W - 20}" '
                f'y2="{rail}" stroke="{C["ink2"]}" stroke-opacity=".55" '
                'stroke-width="2"/>')
-    svg.append(f'<line x1="{LEFT - 60}" y1="{rail + 5}" x2="{W - 20}" '
+    svg.append(f'<line x1="{LEFT - 110}" y1="{rail + 5}" x2="{W - 20}" '
                f'y2="{rail + 5}" stroke="{C["ink2"]}" stroke-opacity=".3" '
                'stroke-width="3" stroke-dasharray="3 10"/>')
 
