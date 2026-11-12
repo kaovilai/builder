@@ -39,6 +39,26 @@ Guidelines:
 - When review finds the same logic in two workflows, the fix is
   extraction, not a better comment on the second copy.
 
+## Known alert noise: base-image Python packages
+
+The repository's Dependabot alerts are dominated by four packages that
+come from the UBI base image as RPMs — `python3-urllib3`, `setuptools`,
+`python3-requests`, and `python3-idna`. The SBOM catalogs their
+`dist-info`/`egg-info` metadata, so Dependabot matches them against
+**upstream pip advisory ranges** (urllib3 2.x, setuptools 84.x, …) that
+RHEL never ships in these streams: RHEL backports the fixes in place and
+keeps the version string. Measured 2026-11-12: `dnf update` in fresh
+ubi8/ubi9/ubi10 images moved 10–11 packages each and cleared none of the
+four — and rebuilding on base-image drift (`ubi-drift-check.yml`)
+already delivers the same package updates, so a build-time `dnf update`
+adds nothing.
+
+Do not try to clear this class with `dnf update` or a pipeline change.
+If the noise ever needs to go, the real levers are removing python3 from
+the images (a breaking change for consumers who run Python scripts in
+them) or excluding `/usr/lib/python*/site-packages` from the SBOM
+catalog — both product decisions, not bug fixes.
+
 ## Commits
 
 Sign off every commit (`git commit -s`) — the DCO check requires it.
