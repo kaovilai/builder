@@ -11,4 +11,4 @@ services:
   actionlint:
     image: rhysd/actionlint:1.7.12
   syft:
-    image: anchore/syft:v1.33.0
+    image: anchore/syft:v1.57.0
