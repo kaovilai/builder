@@ -18,7 +18,7 @@
 # checked first — no timing race; images built before the label
 # existed fall back to the push-time rule.
 #
-# Consumers: release.yml, readme-badges.yml — keep this script the
+# Consumers: release.yml, readme-tracks.yml — keep this script the
 # single owner of the classification rules.
 
 set -euo pipefail

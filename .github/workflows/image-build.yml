@@ -713,5 +713,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh workflow run readme-badges.yml
+          gh workflow run readme-tracks.yml
           gh workflow run submit-sboms.yml

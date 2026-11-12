@@ -181,15 +181,15 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
-          # The badge refresh does not depend on the version check above, so run
-          # it even when that step failed — badges still converge weekly.
-          # readme-badges.yml only makes sense from default-branch runs, so gate
+          # The graphics refresh does not depend on the version check above, so
+          # run it even when that step failed — the tracks still converge weekly.
+          # readme-tracks.yml only makes sense from default-branch runs, so gate
           # it the same way as dispatching.
           if [ "$GITHUB_REF" = "refs/heads/${DEFAULT_BRANCH}" ] && [ "${DRY_RUN}" != "true" ]; then
-            echo "Refreshing README version badges ..."
-            gh workflow run readme-badges.yml
+            echo "Refreshing README version tracks ..."
+            gh workflow run readme-tracks.yml
           else
-            echo "[skip: not on ${DEFAULT_BRANCH} or dry-run] would refresh README version badges"
+            echo "[skip: not on ${DEFAULT_BRANCH} or dry-run] would refresh README version tracks"
           fi
 
       - name: Submit image SBOMs to the dependency graph

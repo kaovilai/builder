@@ -204,7 +204,8 @@ jobs:
               while IFS=$'\t' read -r _ f d t _; do
                 [ -n "$f" ] || continue
                 # history.tsv columns: version, family, kind, digest,
-                # tag. The predecessor is the newest published version
+                # tag, last_modified. The predecessor is the newest
+                # published version
                 # of the same family AND kind older than this release
                 # — the notes describe what upgrading fixes, so
                 # diffing against a newer image would be meaningless,
