@@ -10,7 +10,11 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   .bob  { animation: bob 1.1s ease-in-out infinite alternate; }
   @keyframes bob { to { transform: translateY(1.5px); } }
-  .puff { animation: puff 2.4s ease-out infinite; }
+  .puff { animation: puff 2.4s ease-out infinite;
+          /* scale about the circle's own center; without this the
+             default (0,0) origin drags the puff toward the top-left of
+             the canvas instead of rising above the chimney */
+          transform-box: fill-box; transform-origin: center; }
   @keyframes puff {
     0%   { opacity: 0;   transform: translate(0,0) scale(.4); }
     25%  { opacity: .45; }

@@ -44,17 +44,22 @@ jobs:
           # partial graphic instead of failing the run.
           shopt -s inherit_errexit
 
-          # Both variants come from the one renderer — the train geometry,
-          # the version labels, and the palette live in
+          # Both variants and the text summary come from ONE live-data
+          # snapshot — image variants publish concurrently, so re-fetching
+          # per output could leave the committed light graphic, dark
+          # graphic, and summary disagreeing on the lane heads. The train
+          # geometry, version labels, and palette live in
           # scripts/version-tracks.sh, never duplicated here.
           mkdir -p docs
-          scripts/version-tracks.sh > docs/version-tracks.svg
-          scripts/version-tracks.sh --dark > docs/version-tracks-dark.svg
+          snapshot="$(mktemp)"
+          scripts/version-tracks.sh --snapshot "$snapshot"
+          scripts/version-tracks.sh --from "$snapshot" > docs/version-tracks.svg
+          scripts/version-tracks.sh --from "$snapshot" --dark > docs/version-tracks-dark.svg
 
           # Generated text summary under the graphic: an <img>-embedded SVG
           # exposes none of its labels to assistive tech, so the current
           # versions must also exist as page text.
-          summary_line="$(scripts/version-tracks.sh --summary | jq -r '
+          summary_line="$(scripts/version-tracks.sh --from "$snapshot" --summary | jq -r '
             ["go.dev `\(.godev)`", "ubi `\(.ubi)`",
              (if .fips == "" then empty
               else "ubi go-fips `\(.fips)`"

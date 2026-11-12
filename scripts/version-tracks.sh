@@ -20,11 +20,20 @@
 # family that lags is not depicted separately — the README's available-
 # images table and the quay tags page carry the per-family detail.
 #
-# Usage: version-tracks.sh [--dark]    → SVG on stdout
-#        version-tracks.sh --summary   → one JSON line of lane heads
-#                                        ({"godev":…,"ubi":…,"fips":…,
-#                                        "fips_pre":…}) for the README's
-#                                        generated text summary
+# Usage: version-tracks.sh [--dark] [--summary] [--from <snapshot>]
+#        version-tracks.sh --snapshot <file>
+#   default        render the light SVG on stdout
+#   --dark         render the dark-palette SVG instead
+#   --summary      one JSON line of lane heads ({"godev":…,"ubi":…,
+#                  "fips":…,"fips_pre":…}) for the README's generated
+#                  text summary
+#   --snapshot <f> gather live data once and write the lane snapshot
+#                  (JSON) to <f>; no SVG is rendered
+#   --from <f>     build the output from a snapshot instead of live
+#                  data — the workflow renders light, dark, and the
+#                  summary from ONE snapshot, so a publication landing
+#                  between invocations cannot leave the three outputs
+#                  disagreeing on the lane heads
 # Owners of the inputs: go.dev/dl JSON, shipped-set.sh --history (quay),
 # go-fips-releases.sh + fips-classify.sh (FIPS source classification).
 # Refreshed by .github/workflows/readme-tracks.yml, which commits the
@@ -36,49 +45,66 @@ shopt -s inherit_errexit
 
 MODE=light
 SUMMARY=""
-case "${1:-}" in
-  --dark)    MODE=dark ;;
-  --summary) SUMMARY=1 ;;
-  "")        ;;
-  *)         echo "usage: $0 [--dark|--summary]" >&2; exit 1 ;;
-esac
+SNAPSHOT=""
+FROM=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dark)     MODE=dark ;;
+    --summary)  SUMMARY=1 ;;
+    --snapshot) SNAPSHOT="${2:?--snapshot needs an output file}"; shift ;;
+    --from)     FROM="${2:?--from needs a snapshot file}"; shift ;;
+    *)          echo "usage: $0 [--dark] [--summary] [--from <snapshot>] | --snapshot <file>" >&2; exit 1 ;;
+  esac
+  shift
+done
+[ -z "$FROM" ] || [ -r "$FROM" ] || { echo "ERROR: snapshot $FROM not readable" >&2; exit 1; }
 
 # Engine + this many trailing cars per track (older cars beyond this are
 # dropped so the axis stays readable).
 TRAIL=3
 
-# Upstream stable history, newest first: full releases only — rc/beta
-# entries ("go1.27rc3") are filtered by requiring a pure X.Y.Z version.
-godev_hist="$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all' \
-  | jq -r '[.[] | .version | ltrimstr("go") | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))]
-           | sort_by(split(".") | map(tonumber)) | reverse
-           | .[0:'"$((TRAIL + 1))"'] | .[]')"
+godev_hist=""
+history_tsv=""
+plain_hist=""
+fips_candidates=""
+fips_tag_pre=""
+fips_releases_file=""
+if [ -z "$FROM" ]; then
+  # Upstream stable history, newest first: full releases only — rc/beta
+  # entries ("go1.27rc3") are filtered by requiring a pure X.Y.Z version.
+  # Retries/timeouts follow the repo's go.dev fetch convention.
+  godev_hist="$(curl -fsSL --retry 3 --retry-delay 5 --max-time 30 \
+    'https://go.dev/dl/?mode=json&include=all' \
+    | jq -r '[.[] | .version | ltrimstr("go") | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))]
+             | sort_by(split(".") | map(tonumber)) | reverse
+             | .[0:'"$((TRAIL + 1))"'] | .[]')"
 
-# Published quay history (version, family, kind, digest, tag,
-# last_modified): the shared selector's --history mode is the single
-# owner of the published-tag view (see CONTRIBUTING). FIPS families end
-# in -fips.
-history_tsv="$("$(dirname "$0")/shipped-set.sh" --history)"
-plain_hist="$(awk -F'\t' '$2 !~ /-fips$/ && $3 == "plain" {print $1}' <<< "$history_tsv" \
-  | sort -uV | tail -n "$((TRAIL + 1))")"
-# Every FIPS plain-tag row as version, digest, last_modified — no
-# dedupe or window before classification: pruning first could drop a
-# published stable image because four newer pre-release/unknown
-# versions exhausted the cutoff, and picking one family's row per
-# version could prefer a pre-release-sourced sibling over a stable one.
-# Whether a row is really stable is decided by fips-classify.sh below;
-# identical digests are classified once.
-fips_candidates="$(awk -F'\t' '$2 ~ /-fips$/ && $3 == "plain" {print $1"\t"$4"\t"$6}' <<< "$history_tsv")"
-fips_tag_pre="$(awk -F'\t' '$2 ~ /-fips$/ && $3 == "pre" {print $1}' <<< "$history_tsv" \
-  | sort -uV | tail -n 1)"
+  # Published quay history (version, family, kind, digest, tag,
+  # last_modified): the shared selector's --history mode is the single
+  # owner of the published-tag view (see CONTRIBUTING). FIPS families
+  # end in -fips.
+  history_tsv="$("$(dirname "$0")/shipped-set.sh" --history)"
+  plain_hist="$(awk -F'\t' '$2 !~ /-fips$/ && $3 == "plain" {print $1}' <<< "$history_tsv" \
+    | sort -uV | tail -n "$((TRAIL + 1))")"
+  # Every FIPS plain-tag row as version, digest, last_modified — no
+  # dedupe or window before classification: pruning first could drop a
+  # published stable image because four newer pre-release/unknown
+  # versions exhausted the cutoff, and picking one family's row per
+  # version could prefer a pre-release-sourced sibling over a stable
+  # one. Whether a row is really stable is decided by fips-classify.sh;
+  # identical digests are classified once.
+  fips_candidates="$(awk -F'\t' '$2 ~ /-fips$/ && $3 == "plain" {print $1"\t"$4"\t"$6}' <<< "$history_tsv")"
+  fips_tag_pre="$(awk -F'\t' '$2 ~ /-fips$/ && $3 == "pre" {print $1}' <<< "$history_tsv" \
+    | sort -uV | tail -n 1)"
 
-fips_releases_file="$(mktemp /tmp/version-tracks-fips.XXXXXX)"
-trap 'rm -f "$fips_releases_file"' EXIT
+  fips_releases_file="$(mktemp /tmp/version-tracks-fips.XXXXXX)"
+  trap 'rm -f "$fips_releases_file"' EXIT
+fi
 
-MODE="$MODE" SUMMARY="$SUMMARY" TRAIL="$TRAIL" GODEV="$godev_hist" \
-PLAIN="$plain_hist" FIPS_CANDIDATES="$fips_candidates" FIPS_TAG_PRE="$fips_tag_pre" \
-CLASSIFIER="$(dirname "$0")/fips-classify.sh" FIPS_JSON="$fips_releases_file" \
-FIPS_RELEASES_SRC="$(dirname "$0")/go-fips-releases.sh" \
+MODE="$MODE" SUMMARY="$SUMMARY" SNAPSHOT="$SNAPSHOT" FROM="$FROM" TRAIL="$TRAIL" \
+GODEV="$godev_hist" PLAIN="$plain_hist" FIPS_CANDIDATES="$fips_candidates" \
+FIPS_TAG_PRE="$fips_tag_pre" CLASSIFIER="$(dirname "$0")/fips-classify.sh" \
+FIPS_JSON="$fips_releases_file" FIPS_RELEASES_SRC="$(dirname "$0")/go-fips-releases.sh" \
 python3 <<'PY'
 import json
 import math
@@ -88,67 +114,91 @@ import sys
 
 mode = os.environ["MODE"]
 summary_only = os.environ["SUMMARY"] == "1"
+snapshot_path = os.environ["SNAPSHOT"]
+from_path = os.environ["FROM"]
 trail_n = int(os.environ["TRAIL"])
-godev = os.environ["GODEV"].split()
-plain = os.environ["PLAIN"].split()
-tag_pre = os.environ["FIPS_TAG_PRE"].strip()
-
-# golang-fips release list, materialized once for the classifier (it
-# takes a file, not the generator's stdout)
-releases = os.environ["FIPS_JSON"]
-gen = subprocess.run([os.environ["FIPS_RELEASES_SRC"]],
-                     capture_output=True, text=True)
-if gen.returncode != 0:
-    sys.exit(f"ERROR: golang-fips release list failed: {gen.stderr.strip()}")
-with open(releases, "w") as f:
-    f.write(gen.stdout)
 
 def ver_key(v):
     return [int(p) for p in v.split(".")]
 
-# FIPS plain tags are only "stable" when their golang-fips source
-# classifies stable — the classifier owns the rule (image label first,
-# push-time fallback for pre-label images). Aggregate per version
-# across its family rows: any stable-sourced row makes the version
-# stable; a version with only pre-release sources joins the
-# pre-release selection; unknown sources are excluded from both rather
-# than mislabeled. The window is applied AFTER classification.
-ver_cls = {}
-digest_cls = {}
-for line in os.environ["FIPS_CANDIDATES"].splitlines():
-    if not line.strip():
-        continue
-    ver, digest, ts = line.split("\t")
-    if digest not in digest_cls:
-        cls = subprocess.run(
-            [os.environ["CLASSIFIER"], releases, ver, ts, digest],
-            capture_output=True, text=True)
-        if cls.returncode != 0:
-            sys.exit(f"ERROR: fips-classify failed for {ver}: {cls.stderr.strip()}")
-        digest_cls[digest] = cls.stdout.strip()
-    cls = digest_cls[digest]
-    if cls not in ("true", "false", "unknown"):
-        sys.exit(f"ERROR: unexpected FIPS classification {cls!r} for {ver}")
-    ver_cls.setdefault(ver, set()).add(cls)
+def load_lanes():
+    godev = os.environ["GODEV"].split()
+    plain = os.environ["PLAIN"].split()
+    tag_pre = os.environ["FIPS_TAG_PRE"].strip()
 
-fips_stable = [v for v, cls in ver_cls.items() if "false" in cls]
-fips_pre_versions = [v for v, cls in ver_cls.items()
-                     if "false" not in cls and "true" in cls]
-if tag_pre:
-    fips_pre_versions.append(tag_pre)
-fips_pre = max(sorted(set(fips_pre_versions)), key=ver_key) if fips_pre_versions else ""
+    # golang-fips release list, materialized once for the classifier (it
+    # takes a file, not the generator's stdout)
+    releases = os.environ["FIPS_JSON"]
+    gen = subprocess.run([os.environ["FIPS_RELEASES_SRC"]],
+                         capture_output=True, text=True)
+    if gen.returncode != 0:
+        sys.exit(f"ERROR: golang-fips release list failed: {gen.stderr.strip()}")
+    with open(releases, "w") as f:
+        f.write(gen.stdout)
+
+    # FIPS plain tags are only "stable" when their golang-fips source
+    # classifies stable — the classifier owns the rule (image label
+    # first, push-time fallback for pre-label images). Aggregate per
+    # version across its family rows: any stable-sourced row makes the
+    # version stable; a version with only pre-release sources joins the
+    # pre-release selection; unknown sources are excluded from both
+    # rather than mislabeled. The window is applied AFTER classification.
+    ver_cls = {}
+    digest_cls = {}
+    for line in os.environ["FIPS_CANDIDATES"].splitlines():
+        if not line.strip():
+            continue
+        ver, digest, ts = line.split("\t")
+        if digest not in digest_cls:
+            cls = subprocess.run(
+                [os.environ["CLASSIFIER"], releases, ver, ts, digest],
+                capture_output=True, text=True)
+            if cls.returncode != 0:
+                sys.exit(f"ERROR: fips-classify failed for {ver}: {cls.stderr.strip()}")
+            digest_cls[digest] = cls.stdout.strip()
+        cls = digest_cls[digest]
+        if cls not in ("true", "false", "unknown"):
+            sys.exit(f"ERROR: unexpected FIPS classification {cls!r} for {ver}")
+        ver_cls.setdefault(ver, set()).add(cls)
+
+    fips_stable = [v for v, cls in ver_cls.items() if "false" in cls]
+    fips_pre_versions = [v for v, cls in ver_cls.items()
+                         if "false" not in cls and "true" in cls]
+    if tag_pre:
+        fips_pre_versions.append(tag_pre)
+
+    return {
+        "godev": sorted(set(godev), key=ver_key),
+        "plain": sorted(set(plain), key=ver_key),
+        "fips": sorted(set(fips_stable), key=ver_key),
+        "fips_pre": max(sorted(set(fips_pre_versions)), key=ver_key)
+                     if fips_pre_versions else "",
+    }
+
+if from_path:
+    with open(from_path) as f:
+        lanes = json.load(f)
+else:
+    lanes = load_lanes()
+
+if snapshot_path:
+    with open(snapshot_path, "w") as f:
+        json.dump(lanes, f, separators=(",", ":"))
+    sys.exit(0)
 
 def head_of(vs):
     return max(sorted(set(vs)), key=ver_key) if vs else ""
 
-heads = {"godev": head_of(godev), "ubi": head_of(plain), "fips": head_of(fips_stable)}
+heads = {"godev": head_of(lanes["godev"]), "ubi": head_of(lanes["plain"]),
+         "fips": head_of(lanes["fips"])}
 if summary_only:
-    print(json.dumps({**heads, "fips_pre": fips_pre}, separators=(",", ":")))
+    print(json.dumps({**heads, "fips_pre": lanes["fips_pre"]}, separators=(",", ":")))
     sys.exit(0)
 
 # window the classified-stable versions only now, so the axis covers
 # exactly the cars that are drawn
-fips = sorted(set(fips_stable), key=ver_key)[-(trail_n + 1):]
+fips = lanes["fips"][-(trail_n + 1):]
+fips_pre = lanes["fips_pre"]
 
 # Categorical palette (fixed slot order: the three tracks in their
 # listed order), validated for CVD separation and contrast on both
@@ -165,11 +215,11 @@ else:
              lamp="#eda100")
 
 tracks = [
-    ("go.dev", C["blue"], godev, None,
+    ("go.dev", C["blue"], lanes["godev"], None,
      "upstream stable releases"),
     ("ubi go-fips", C["orange"], fips, fips_pre,
      "FIPS images on quay"),
-    ("ubi", C["aqua"], plain, None,
+    ("ubi", C["aqua"], lanes["plain"], None,
      "standard images on quay"),
 ]
 
@@ -296,9 +346,8 @@ def engine(ex, rail, color, ver):
                  f'r="4" fill="{C["ink2"]}" style="animation-delay:'
                  f'{delay}s"/>')
     # headlight
-    svg_lamp = (f'<circle cx="{ex + 41}" cy="{rail - 30}" r="3.5" '
-                f'fill="{C["lamp"]}"/>')
-    s.append(svg_lamp)
+    s.append(f'<circle cx="{ex + 41}" cy="{rail - 30}" r="3.5" '
+             f'fill="{C["lamp"]}"/>')
     # wheels
     for cx in (ex - 28, ex - 6, ex + 20):
         s.append(wheel(cx, rail - 7, 7, color))
