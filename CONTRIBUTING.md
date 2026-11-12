@@ -19,6 +19,7 @@ Current single owners:
 | Release-notes security context — upstream source links (go.dev, golang-fips) and the Go CVEs fixed by a version, from the OSV.dev query of the Go vulnerability database | `scripts/release-sources.sh` |
 | Release-notes base diff — the RHEL/UBI CVEs fixed between the previous and current image of a family, from trivy OS-package scans of both digests | `scripts/base-cve-diff.sh` |
 | CI tool image pins — syft, actionlint versions; declared in `docker-compose.yml` (bumped by Dependabot's docker-compose ecosystem, since neither the docker nor github-actions ecosystems can see `docker run` references in workflow run blocks) and read by workflows through the single lookup | `docker-compose.yml` + `scripts/tool-pins.sh` |
+| README version-tracks graphic — the animated SVG (light + dark) showing the latest stable Go per source as trains over a shared version axis, older releases trailing behind each engine | `scripts/version-tracks.sh` (data from go.dev/dl and `shipped-set.sh --history`; rendered files `docs/version-tracks{,-dark}.svg`, committed by `.github/workflows/readme-tracks.yml`) |
 
 Why this is a rule and not a preference: every copy of a rule must be
 found and updated in lockstep, and copies drift. Both failure modes
