@@ -1,0 +1,14 @@
+# Tool image pins for the CI workflows, as the single source of truth
+# for their versions: Dependabot's docker-compose ecosystem bumps these
+# (see .github/dependabot.yml), and the workflows read the image
+# references through scripts/tool-pins.sh — never hardcode a tag in a
+# `docker run` again; a tag Dependabot cannot see is a tag that rots
+# (the syft 1.33.0 release-run failure was exactly this).
+#
+# Only pullable, externally-versioned tools belong here; locally built
+# images (e.g. builder-e2e:test) do not.
+services:
+  actionlint:
+    image: rhysd/actionlint:1.7.12
+  syft:
+    image: anchore/syft:v1.33.0

@@ -100,7 +100,9 @@ jobs:
               for platform in $PLATFORMS; do
                 out="${f}-${platform//\//-}-${d#sha256:}.spdx.json"
                 [ -n "$3" ] && grep -qx "$out" "$3" && continue
-                docker run --rm -v "${2}:/out" docker.io/anchore/syft:1.33.0 \
+                # image pin owned by docker-compose.yml, bumped by
+                # Dependabot (single owner: scripts/tool-pins.sh)
+                docker run --rm -v "${2}:/out" "$(scripts/tool-pins.sh syft)" \
                   scan "$image" --platform "$platform" -o spdx-json --file "/out/${out}" >/dev/null
               done
             done <<< "$1"

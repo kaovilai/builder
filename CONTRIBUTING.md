@@ -18,6 +18,7 @@ Current single owners:
 | Variant registry — which UBI majors and flavors ship | `variants.txt` (workflows enumerate it; adding a variant is adding a line) |
 | Release-notes security context — upstream source links (go.dev, golang-fips) and the Go CVEs fixed by a version, from the OSV.dev query of the Go vulnerability database | `scripts/release-sources.sh` |
 | Release-notes base diff — the RHEL/UBI CVEs fixed between the previous and current image of a family, from trivy OS-package scans of both digests | `scripts/base-cve-diff.sh` |
+| CI tool image pins — syft, actionlint versions; declared in `docker-compose.yml` (bumped by Dependabot's docker-compose ecosystem, since neither the docker nor github-actions ecosystems can see `docker run` references in workflow run blocks) and read by workflows through the single lookup | `docker-compose.yml` + `scripts/tool-pins.sh` |
 
 Why this is a rule and not a preference: every copy of a rule must be
 found and updated in lockstep, and copies drift. Both failure modes

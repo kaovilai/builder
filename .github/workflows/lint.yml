@@ -8,9 +8,14 @@ on:
   pull_request:
     paths:
       - '.github/workflows/**'
+      # the actionlint image pin and its lookup feed this job
+      - 'docker-compose.yml'
+      - 'scripts/tool-pins.sh'
   push:
     paths:
       - '.github/workflows/**'
+      - 'docker-compose.yml'
+      - 'scripts/tool-pins.sh'
 
 permissions:
   contents: read
@@ -22,10 +27,25 @@ jobs:
       - name: add checkout action...
         uses: actions/checkout@v7
 
+      - name: validate tool image pins...
+        # a pin that does not resolve is exactly the syft 1.33.0
+        # release-run failure class; catch it here, at PR time, where
+        # the release dry-run cannot (it skips SBOM scanning)
+        run: |
+          set -euo pipefail
+          while read -r service; do
+            [ -n "$service" ] || continue
+            image="$(scripts/tool-pins.sh "$service")"
+            docker pull -q "$image" >/dev/null
+            echo "pin ok: ${service} -> ${image}"
+          done < <(scripts/tool-pins.sh --all)
+
       - name: run actionlint...
         # The ignored shellcheck codes are deliberate repo patterns: ls | sort
         # pipelines in the variant enumerations, and
         # unquoted $(ls /tmp/digests) word-splitting when passing digest lists.
         run: |
-          docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color \
+          # image pin owned by docker-compose.yml, bumped by Dependabot
+          # (single owner of the lookup: scripts/tool-pins.sh)
+          docker run --rm -v "$PWD:/repo" -w /repo "$(scripts/tool-pins.sh actionlint)" -color \
             -ignore 'shellcheck reported issue in this script: SC(2010|2012|2046|2086)'
