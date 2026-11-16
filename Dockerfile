@@ -32,7 +32,11 @@ RUN if [ -z "$GO_VERSION" ] || [ "$GO_VERSION" = "go" ]; then \
 FROM registry.access.redhat.com/ubi${UBI_MAJOR}:latest AS final
 # Consumers compile inside this image: gcc/gcc-c++ keep cgo working
 # (CGO_ENABLED defaults to 1). perl arrives as a dependency of git.
-RUN dnf -y install git make jq unzip gcc gcc-c++ && \
+# diffutils is explicit: the UBI base no longer guarantees `diff`, and
+# consumers (e.g. OADP's `make test` via api-isupdated/bundle-isupdated)
+# need it to diff regenerated copies and detect stale generated files —
+# without it those checks false-fail as "out of date".
+RUN dnf -y install git make jq unzip gcc gcc-c++ diffutils && \
     dnf clean all
 COPY --from=builder /opt/app-root/src/go /opt/app-root/src/go
 
